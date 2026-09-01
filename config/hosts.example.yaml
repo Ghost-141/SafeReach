@@ -1,0 +1,75 @@
+# ------------------------------------------------------------------------------------
+# hosts.yaml — read only by the server, never exposed to the agent.
+#
+# The agent sees `alias` and `description`. It never sees hostname, username, key path,
+# or port: it says host="web-01" and the server resolves it. That is what stops an agent
+# from aiming this at a machine it was not granted.
+#
+# Keep this file mode 0600. `safereach doctor` warns if it is looser.
+# ------------------------------------------------------------------------------------
+
+defaults:
+  port: 22
+  connect_timeout: 10
+  command_timeout: 30
+  max_output_bytes: 65536
+  known_hosts: ~/.ssh/known_hosts # NEVER null — that would disable host key checking
+  audit_log: ~/.local/state/safereach/audit.jsonl
+
+hosts:
+  web-01:
+    hostname: 10.0.1.5
+    user: diag
+    key: ~/.ssh/id_ed25519_diag
+    description: "prod web frontend (nginx + app)"
+
+    # Intersected with commands.yaml — a host can only ever narrow the global
+    # allowlist, never widen it.
+    allow:
+      [journalctl, systemctl, dmesg, df, du, free, uptime, ps, ss, ip, tail, head, grep, stat, ls, docker, curl]
+
+    # --- docker -----------------------------------------------------------------
+    # Point at a READ-ONLY socket proxy, not /var/run/docker.sock. Membership of the
+    # docker group is equivalent to root on the host, so the proxy is what keeps a
+    # parser bug from becoming a host compromise.
+    #   docker run -d --name dsp -p 127.0.0.1:2375:2375 \
+    #     -e CONTAINERS=1 -e IMAGES=1 -e NETWORKS=1 -e VOLUMES=1 -e POST=0 -e EXEC=0 \
+    #     -v /var/run/docker.sock:/var/run/docker.sock:ro tecnativa/docker-socket-proxy
+    docker_host: "tcp://127.0.0.1:2375"
+
+    # Container env values are masked by default — Config.Env is where DATABASE_URL and
+    # *_TOKEN live, and `docker inspect` is a command the agent will call constantly.
+    # Names listed here come back in the clear; everything else is masked. Keys stay
+    # visible either way, so the agent can still reason about what is set.
+    env_allowlist: [NODE_ENV, LOG_LEVEL, PORT, HOSTNAME]
+
+    # --- curl -------------------------------------------------------------------
+    # The URL host must appear here. Defaults to empty, meaning curl reaches nothing —
+    # otherwise curl on an internal box is an outbound exfiltration channel.
+    curl_targets: [localhost, 127.0.0.1]
+    curl_insecure: false # gates whether -k is accepted at all
+
+    # --- elevated recipes -------------------------------------------------------
+    # Fixed invocations the shim may run under sudo, selected by name. The agent sends
+    # "dmesg-recent", never a command line. Each needs a matching exact-match entry in
+    # /etc/sudoers.d/diag on the host.
+    elevated: [dmesg-recent]
+
+  db-01:
+    hostname: 10.0.1.9
+    user: diag
+    key: ~/.ssh/id_ed25519_diag
+    description: "primary postgres"
+    allow: [journalctl, systemctl, df, du, free, uptime, ps, ss, tail, stat]
+    # no docker, no curl, no elevated recipes on this host
+
+  # A local container is the right way to try this out — see the README.
+  test-local:
+    hostname: 127.0.0.1
+    port: 2222
+    user: diag
+    key: ~/.ssh/id_ed25519_diag
+    description: "throwaway sshd container for testing"
+    allow: [journalctl, systemctl, df, free, uptime, ps, ss, tail, docker, curl]
+    docker_host: "tcp://127.0.0.1:2375"
+    curl_targets: [localhost, 127.0.0.1]

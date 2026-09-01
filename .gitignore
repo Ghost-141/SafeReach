@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+shim/dist/
+.pytest_cache/
+.ruff_cache/
+hosts.yaml
+*.bak-*
+docs/

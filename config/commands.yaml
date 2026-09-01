@@ -1,0 +1,586 @@
+# ------------------------------------------------------------------------------------
+# commands.yaml — the command allowlist.
+#
+# This file is DATA, and it is the thing that decides what an agent may run. Read
+# `docs: adding a binary` in the README before extending it. The short version:
+#
+#   * Allowlisting a binary means enumerating its SAFE FLAGS, not just its name. Several
+#     innocuous-looking tools are shells in disguise (`find -exec`, `awk BEGIN{system()}`,
+#     `tar --to-command`, pager `!sh` escapes). Default-deny on flags is what contains it.
+#   * Anything that writes a file, spawns a child process, or follows a stream forever
+#     does not belong here.
+#   * `deny_flags` / `deny_subcommands` are not required for safety — everything is
+#     default-deny already — but they turn a blank "not permitted" into an explanation,
+#     which is what lets an agent correct itself instead of guessing.
+#
+# Value types: {type: int, min:, max:} | {type: enum, choices: []} | {type: regex, pattern:}
+# A flag with `value: none` (or written as `"-x": none`) takes no value.
+# ------------------------------------------------------------------------------------
+
+# ------------------------------- logs & services -------------------------------------
+
+journalctl:
+  description: Read the systemd journal
+  force_flags: ["--no-pager"]
+  flags:
+    "-u": { alias: "--unit", repeatable: true, value: { type: regex, pattern: '[A-Za-z0-9@._\-]{1,128}' } }
+    "-n": { alias: "--lines", value: { type: int, min: 1, max: 2000 } }
+    "-p": { alias: "--priority", value: { type: enum, choices: [emerg, alert, crit, err, warning, notice, info, debug] } }
+    "-k": { alias: "--dmesg", value: none }
+    "-x": { alias: "--catalog", value: none }
+    "-r": { alias: "--reverse", value: none }
+    "--since": { value: { type: regex, pattern: '[A-Za-z0-9 :+\-]{1,32}' } }
+    "--until": { value: { type: regex, pattern: '[A-Za-z0-9 :+\-]{1,32}' } }
+    "--grep": { value: { type: regex, pattern: '[^`$\\]{1,200}' } }
+    "--output": { value: { type: enum, choices: [short, short-iso, short-precise, cat, json, json-pretty] } }
+    "--no-pager": { value: none }
+  positionals: { max: 0 }
+  deny_flags:
+    "-f": "--follow streams forever and would hang the connection"
+    "--follow": "streams forever and would hang the connection"
+    "--vacuum-size": "deletes journal data"
+    "--vacuum-time": "deletes journal data"
+    "--rotate": "mutates the journal"
+    "--flush": "mutates the journal"
+
+systemctl:
+  description: Inspect systemd unit state (read-only subcommands only)
+  force_flags: ["--no-pager"]
+  subcommands: [status, is-active, is-enabled, is-failed, list-units, list-timers, list-sockets, show, cat]
+  # `show` is only safe when narrowed; the bare form dumps Environment=.
+  # `show-environment` is removed entirely — its whole purpose is dumping the environment.
+  required_flags_for:
+    show: ["-p"]
+  flags:
+    "--failed": { value: none }
+    "--all": { value: none }
+    "--no-pager": { value: none }
+    "-l": { alias: "--full", value: none }
+    "--type": { value: { type: enum, choices: [service, timer, socket, mount, target, path] } }
+    "--state": { value: { type: regex, pattern: '[a-z\-,]{1,64}' } }
+    # LAYER 0 — structural removal. `systemctl show` with no --property dumps every
+    # property including Environment= and EnvironmentFiles=, which is a container's or
+    # unit's entire secret set. Rather than scrub that with a regex afterwards, the
+    # property is pinned to an enum that simply does not contain it. A capability that
+    # does not exist cannot leak.
+    "-p": { alias: "--property", repeatable: true, value: { type: enum, choices:
+        [ActiveState, SubState, LoadState, UnitFileState, Result, MainPID,
+         ExecMainStatus, ExecMainStartTimestamp, ExecMainExitTimestamp, NRestarts,
+         MemoryCurrent, MemoryPeak, MemoryAvailable, CPUUsageNSec, TasksCurrent,
+         TasksMax, ActiveEnterTimestamp, ActiveExitTimestamp, InactiveEnterTimestamp,
+         ConditionResult, AssertResult, FragmentPath, Description, StatusText,
+         RestartUSec, WatchdogUSec, Following, TriggeredBy, Triggers] } }
+  positionals: { max: 5, pattern: '[A-Za-z0-9@._:\-]{1,128}' }
+  deny_subcommands:
+    start: "changes service state"
+    stop: "changes service state"
+    restart: "changes service state"
+    reload: "changes service state"
+    kill: "changes service state"
+    enable: "changes boot configuration"
+    disable: "changes boot configuration"
+    mask: "changes boot configuration"
+    unmask: "changes boot configuration"
+    daemon-reload: "mutates systemd state"
+    isolate: "changes the running target"
+    poweroff: "shuts the host down"
+    reboot: "reboots the host"
+    edit: "writes unit files"
+    set-property: "mutates unit configuration"
+
+dmesg:
+  description: Kernel ring buffer — OOM kills, disk and hardware errors
+  flags:
+    "-T": { alias: "--ctime", value: none }
+    "-x": { alias: "--decode", value: none }
+    "-l": { alias: "--level", value: { type: regex, pattern: '[a-z,]{1,64}' } }
+    "--level": { value: { type: regex, pattern: '[a-z,]{1,64}' } }
+  positionals: { max: 0 }
+  deny_flags:
+    "-C": "clears the ring buffer"
+    "--clear": "clears the ring buffer"
+    "-c": "clears the ring buffer after printing"
+    "-w": "--follow streams forever"
+    "--follow": "streams forever and would hang the connection"
+
+# --------------------------------- resources -----------------------------------------
+
+df:
+  description: Filesystem disk usage
+  flags:
+    "-h": { alias: "--human-readable", value: none }
+    "-i": { alias: "--inodes", value: none }
+    "-T": { alias: "--print-type", value: none }
+    "-l": { alias: "--local", value: none }
+  positionals: { max: 4, pattern: '/[A-Za-z0-9._/\-]{0,255}|/' }
+
+du:
+  description: Directory space usage
+  flags:
+    "-h": { alias: "--human-readable", value: none }
+    "-s": { alias: "--summarize", value: none }
+    "-x": { alias: "--one-file-system", value: none }
+    "-d": { alias: "--max-depth", value: { type: int, min: 0, max: 5 } }
+  positionals:
+    max: 3
+    pattern: '/[A-Za-z0-9._/\-]{1,255}'
+    path_prefixes: ["/var/", "/tmp/", "/opt/", "/srv/", "/home/"]
+
+free:
+  description: Memory and swap usage
+  flags:
+    "-h": { alias: "--human", value: none }
+    "-m": { value: none }
+    "-g": { value: none }
+    "-w": { alias: "--wide", value: none }
+  positionals: { max: 0 }
+  deny_flags:
+    "-s": "repeats forever and would hang the connection"
+
+uptime:
+  description: Load average and time since boot
+  flags:
+    "-p": { alias: "--pretty", value: none }
+  positionals: { max: 0 }
+
+nproc:
+  description: Number of processing units available
+  flags:
+    "--all": { value: none }
+  positionals: { max: 0 }
+
+hostnamectl:
+  description: Host, kernel and OS identity
+  subcommands: [status]
+  flags:
+    "--no-pager": { value: none }
+  positionals: { max: 0 }
+  deny_subcommands:
+    set-hostname: "changes host identity"
+    set-location: "changes host metadata"
+
+ps:
+  description: Process table
+  flags:
+    "-e": { value: none }
+    "-f": { value: none }
+    "-a": { value: none }
+    "-u": { value: none }
+    "-x": { value: none }
+    "-o": { value: { type: regex, pattern: '[a-z_,=:%\-]{1,120}' } }
+    "--sort": { value: { type: regex, pattern: '[a-z_,+\-]{1,60}' } }
+  positionals: { max: 0 }
+
+# ---------------------------------- network ------------------------------------------
+
+ss:
+  description: Socket statistics — what is listening and what is connected
+  flags:
+    "-t": { value: none }
+    "-u": { value: none }
+    "-l": { value: none }
+    "-n": { value: none }
+    "-a": { value: none }
+    "-p": { value: none }
+    "-s": { value: none }
+    "-4": { value: none }
+    "-6": { value: none }
+  positionals: { max: 0 }
+
+ip:
+  description: Network interfaces, addresses and routes
+  subcommands: [addr, address, link, route, neigh, rule]
+  flags:
+    "-4": { value: none }
+    "-6": { value: none }
+    "-br": { value: none }
+    "-s": { value: none }
+  positionals:
+    max: 2
+    pattern: '[A-Za-z0-9._:\-]{1,64}'
+    # `ip`'s subcommands are read-only NAMES (addr, route, link) — the mutating verb
+    # sits in the positional slot, where deny_subcommands never looks. Without this,
+    # `ip route del default` takes the host off the network.
+    #
+    # deny_mutating draws on validator.MUTATING_VERBS rather than a list kept here, so
+    # the runtime check and the spec linter cannot drift apart.
+    deny_mutating: true
+  deny_subcommands:
+    tunnel: "mutates network configuration"
+    netns: "mutates network namespaces"
+    xfrm: "mutates IPsec state"
+
+# --------------------------------- files & text --------------------------------------
+#
+# Every path-taking binary is constrained by `path_prefixes`, and the validator rejects
+# any '..' segment before the prefix is tested — otherwise /var/log/../../etc/shadow
+# would satisfy the prefix and then climb straight out of it.
+
+tail:
+  description: Last lines of a log file
+  flags:
+    "-n": { alias: "--lines", value: { type: int, min: 1, max: 2000 } }
+    "-q": { alias: "--quiet", value: none }
+    "-v": { alias: "--verbose", value: none }
+  positionals:
+    max: 3
+    pattern: '/var/log/[A-Za-z0-9._/\-]{1,200}'
+    path_prefixes: ["/var/log/"]
+  deny_flags:
+    "-f": "--follow streams forever and would hang the connection"
+    "--follow": "streams forever and would hang the connection"
+    "-F": "streams forever and would hang the connection"
+
+head:
+  description: First lines of a log file
+  flags:
+    "-n": { alias: "--lines", value: { type: int, min: 1, max: 2000 } }
+    "-q": { alias: "--quiet", value: none }
+  positionals:
+    max: 3
+    pattern: '/var/log/[A-Za-z0-9._/\-]{1,200}'
+    path_prefixes: ["/var/log/"]
+
+grep:
+  description: Search within permitted log files
+  flags:
+    "-i": { alias: "--ignore-case", value: none }
+    "-n": { alias: "--line-number", value: none }
+    "-c": { alias: "--count", value: none }
+    "-E": { alias: "--extended-regexp", value: none }
+    "-F": { alias: "--fixed-strings", value: none }
+    "-r": { alias: "--recursive", value: none }
+    "-v": { alias: "--invert-match", value: none }
+    "-m": { alias: "--max-count", value: { type: int, min: 1, max: 2000 } }
+    "-A": { alias: "--after-context", value: { type: int, min: 0, max: 20 } }
+    "-B": { alias: "--before-context", value: { type: int, min: 0, max: 20 } }
+  positionals:
+    # Position-aware: the first argument is the search pattern (free text), everything
+    # after it is a file path and must stay inside /var/log. A single flat rule loose
+    # enough for the pattern would also permit `grep root /etc/shadow`.
+    max: 4
+    specs:
+      - { pattern: '[^`$\\]{1,200}' }
+    rest:
+      pattern: '/var/log/[A-Za-z0-9._/\-]{1,200}'
+      path_prefixes: ["/var/log/"]
+  deny_flags:
+    "-f": "--file reads the pattern list from an arbitrary file"
+    "--file": "reads the pattern list from an arbitrary file"
+    "--include-dir": "widens the search beyond permitted paths"
+    "-d": "--directories=recurse can walk outside permitted paths"
+
+stat:
+  description: File metadata — size, owner, modification time
+  flags:
+    "-c": { alias: "--format", value: { type: regex, pattern: '[A-Za-z0-9 %_:.\-]{1,80}' } }
+    "-L": { alias: "--dereference", value: none }
+  positionals:
+    max: 4
+    pattern: '/[A-Za-z0-9._/\-]{1,200}'
+    path_prefixes: ["/var/log/", "/etc/systemd/", "/opt/", "/srv/", "/var/lib/"]
+
+ls:
+  description: Directory listing for permitted paths
+  flags:
+    "-l": { value: none }
+    "-a": { value: none }
+    "-h": { value: none }
+    "-t": { value: none }
+    "-r": { value: none }
+    "-S": { value: none }
+  positionals:
+    max: 2
+    pattern: '/[A-Za-z0-9._/\-]{1,200}'
+    path_prefixes: ["/var/log/", "/etc/systemd/", "/opt/", "/srv/", "/var/lib/"]
+
+# ---------------------------------- containers ---------------------------------------
+#
+# `docker` is the highest-severity entry in this file. Membership of the `docker` group
+# is equivalent to root on the host (`docker run -v /:/host` mounts the filesystem), so
+# this allowlist is not merely protecting containers — it is the barrier to host root.
+# Deploy with DOCKER_HOST pointed at a read-only socket proxy as well; see the README.
+#
+# Short flags are rejected wholesale because docker's short namespace is ambiguous:
+# `-f` is --follow on `logs` but --filter on `ps`. Requiring long form removes the
+# entire class rather than special-casing one instance of it.
+
+docker:
+  description: Inspect containers, images, networks and volumes (read-only)
+  short_flags: forbidden
+  subcommand_paths:
+    - path: [ps]
+      flags:
+        "--all": none
+        "--filter": { value: { type: regex, pattern: '[a-z]{1,16}=[A-Za-z0-9._*\-]{1,64}' } }
+        "--last": { value: { type: int, min: 1, max: 100 } }
+        "--size": none
+    - path: [inspect]
+      flags:
+        "--format": { value: { type: regex, pattern: '[A-Za-z0-9 {}._$|"''\[\]\-]{1,160}' } }
+        "--size": none
+    - path: [logs]
+      force: ["--tail", "500"]
+      flags:
+        "--tail": { value: { type: int, min: 1, max: 2000 } }
+        "--since": { value: { type: regex, pattern: '[A-Za-z0-9:+.\-]{1,32}' } }
+        "--until": { value: { type: regex, pattern: '[A-Za-z0-9:+.\-]{1,32}' } }
+        "--timestamps": none
+        "--details": none
+    - path: [stats]
+      force: ["--no-stream"]
+      flags:
+        "--no-stream": none
+        "--all": none
+        "--format": { value: { type: regex, pattern: '[A-Za-z0-9 {}._\-]{1,120}' } }
+    - path: [top]
+    - path: [port]
+    - path: [diff]
+    - path: [history]
+      flags:
+        "--no-trunc": none
+    - path: [images]
+      flags:
+        "--all": none
+        "--filter": { value: { type: regex, pattern: '[a-z]{1,16}=[A-Za-z0-9._*\-]{1,64}' } }
+    - path: [version]
+    - path: [info]
+    - path: [container, ls]
+      flags:
+        "--all": none
+        "--filter": { value: { type: regex, pattern: '[a-z]{1,16}=[A-Za-z0-9._*\-]{1,64}' } }
+    - path: [container, inspect]
+      flags:
+        "--format": { value: { type: regex, pattern: '[A-Za-z0-9 {}._$|"''\[\]\-]{1,160}' } }
+    - path: [container, logs]
+      force: ["--tail", "500"]
+      flags:
+        "--tail": { value: { type: int, min: 1, max: 2000 } }
+        "--timestamps": none
+    - path: [container, top]
+    - path: [container, port]
+    - path: [container, diff]
+    - path: [container, stats]
+      force: ["--no-stream"]
+      flags:
+        "--no-stream": none
+    - path: [image, ls]
+    - path: [image, inspect]
+      flags:
+        "--format": { value: { type: regex, pattern: '[A-Za-z0-9 {}._$|"''\[\]\-]{1,160}' } }
+    - path: [image, history]
+    - path: [network, ls]
+    - path: [network, inspect]
+      flags:
+        "--format": { value: { type: regex, pattern: '[A-Za-z0-9 {}._$|"''\[\]\-]{1,160}' } }
+    - path: [volume, ls]
+    - path: [volume, inspect]
+    - path: [compose, ps]
+      flags:
+        "--all": none
+    - path: [compose, logs]
+      force: ["--tail", "500"]
+      flags:
+        "--tail": { value: { type: int, min: 1, max: 2000 } }
+        "--timestamps": none
+    # `compose config` renders the fully-resolved file, secrets and all, and there is
+    # no flag that suppresses values. `--services` alone is safe, so that is kept as a
+    # distinct path and the bare form is denied below.
+    - path: [compose, config]
+      required_flags: ["--services"]
+      flags:
+        "--services": none
+  positionals: { max: 3, pattern: '[A-Za-z0-9][A-Za-z0-9_./:@\-]{0,127}' }
+  deny_flags:
+    "--follow": "streams forever and would hang the connection"
+    "--host": "would redirect docker at a different daemon"
+  deny_subcommands:
+    exec: "arbitrary code execution inside the container"
+    run: "arbitrary code execution, and -v can mount the host filesystem"
+    create: "creates containers"
+    attach: "attaches an interactive session"
+    cp: "reads and writes arbitrary paths on host or container"
+    rm: "deletes containers"
+    rmi: "deletes images"
+    kill: "changes container state"
+    stop: "changes container state"
+    start: "changes container state"
+    restart: "changes container state"
+    pause: "changes container state"
+    unpause: "changes container state"
+    update: "changes resource limits"
+    build: "builds images and writes to disk"
+    commit: "writes a new image"
+    save: "writes an image archive to disk"
+    load: "reads an image archive from disk"
+    export: "writes a container archive to disk"
+    import: "creates an image from an archive"
+    push: "sends images to a registry"
+    pull: "fetches images from a registry"
+    login: "handles registry credentials"
+    logout: "handles registry credentials"
+    system: "prune is destructive"
+    swarm: "mutates cluster state"
+    service: "mutates cluster state"
+    stack: "mutates cluster state"
+    node: "mutates cluster state"
+    secret: "exposes cluster secrets"
+    config: "exposes cluster configuration"
+    events: "streams forever with no natural terminus"
+    wait: "blocks until the container stops"
+    config: "compose config renders every resolved secret inline; use `compose config --services`"
+
+# ---------------------------------- endpoints ----------------------------------------
+#
+# curl is a file-read and file-write primitive that happens to speak HTTP. Four pins,
+# all independent: scheme (force-injected --proto), method (-X denied, so GET or HEAD),
+# target host (per-host curl_targets allowlist), and no local file access (@-values
+# rejected globally, -o restricted to /dev/null).
+
+curl:
+  description: Check whether an HTTP endpoint responds (GET/HEAD only)
+  reject_at_values: true
+  force_args:
+    ["--silent", "--show-error", "--proto", "=http,https", "--max-time", "15", "--max-redirs", "3"]
+  flags:
+    "-I": { alias: "--head", value: none }
+    "-i": { alias: "--include", value: none }
+    "-L": { alias: "--location", value: none }
+    "-s": { alias: "--silent", value: none }
+    "-S": { alias: "--show-error", value: none }
+    "-k": { alias: "--insecure", value: none }
+    "-o": { alias: "--output", value: { type: enum, choices: ["/dev/null"] } }
+    "-w": { alias: "--write-out", value: { type: regex, pattern: '[A-Za-z0-9 _:.%{}\\n\-]{1,200}' } }
+    "-H": { alias: "--header", value: { type: regex, pattern: '[A-Za-z0-9\-]{1,40}: [^@\r\n]{1,200}' } }
+    "--max-time": { value: { type: int, min: 1, max: 60 } }
+    "--connect-timeout": { value: { type: int, min: 1, max: 30 } }
+    "--max-redirs": { value: { type: int, min: 0, max: 10 } }
+    "--proto": { value: { type: enum, choices: ["=http,https"] } }
+    "--retry": { value: { type: int, min: 0, max: 3 } }
+  positionals:
+    max: 1
+    pattern: 'https?://[A-Za-z0-9._\-]{1,253}(:[0-9]{1,5})?(/[A-Za-z0-9._~%/\-]*)?(\?[A-Za-z0-9._~%&=+\-]*)?'
+    host_allowlist_from: curl_targets
+  deny_flags:
+    "--unix-socket": "speaks the Docker API directly — remote code execution"
+    "--abstract-unix-socket": "speaks the Docker API directly — remote code execution"
+    "-K": "--config loads options from a file, bypassing this allowlist entirely"
+    "--config": "loads options from a file, bypassing this allowlist entirely"
+    "-d": "--data sends a request body and can exfiltrate local files with @"
+    "--data": "sends a request body and can exfiltrate local files with @"
+    "--data-binary": "can exfiltrate local files with @"
+    "--data-raw": "sends a request body; only GET and HEAD are permitted"
+    "-F": "--form can exfiltrate local files with @"
+    "--form": "can exfiltrate local files with @"
+    "-T": "--upload-file writes to the remote endpoint"
+    "--upload-file": "writes to the remote endpoint"
+    "-O": "--remote-name writes a file to disk"
+    "--remote-name": "writes a file to disk"
+    "-X": "--request would permit methods other than GET and HEAD"
+    "--request": "would permit methods other than GET and HEAD"
+    "--netrc": "reads stored credentials"
+    "--netrc-file": "reads stored credentials"
+    "-u": "--user passes credentials on the command line"
+    "--user": "passes credentials on the command line"
+    "-x": "--proxy pivots the request through another host"
+    "--proxy": "pivots the request through another host"
+    "-E": "--cert uses a client certificate"
+    "--cert": "uses a client certificate"
+    "--key": "uses a client private key"
+    "--resolve": "overrides DNS to reach an unlisted host"
+    "--trace": "writes a trace file to disk"
+    "--trace-ascii": "writes a trace file to disk"
+
+# --------------------------------- kubernetes ----------------------------------------
+#
+# Read-only verbs only, and `secret` is denied as a resource everywhere — `kubectl get
+# secret -o yaml` returns base64 values, which is a one-step path to every credential in
+# the namespace. `-o yaml/json` on other resources can still surface inline `env:` values,
+# so the redaction pass applies to kubectl output as well.
+#
+# IMPORTANT: this allowlist is not the real control. RBAC is. Give the diag user a
+# kubeconfig bound to a Role that excludes secrets, exactly as DOCKER_HOST points at a
+# read-only socket proxy — so a parser bug degrades to "read something it shouldn't"
+# rather than "read every credential in the cluster".
+
+kubectl:
+  description: Inspect Kubernetes resources (read-only)
+  short_flags: forbidden
+  subcommand_paths:
+    - path: [get]
+      flags:
+        "--namespace": { value: { type: regex, pattern: '[a-z0-9][a-z0-9\-]{0,62}' } }
+        "--all-namespaces": none
+        # LAYER 0 — json/yaml carry inline `env:` values verbatim. wide/name do not.
+        "--output": { value: { type: enum, choices: [wide, name] } }
+        "--selector": { value: { type: regex, pattern: '[A-Za-z0-9._/=,\-]{1,128}' } }
+        "--field-selector": { value: { type: regex, pattern: '[A-Za-z0-9._/=,\-]{1,128}' } }
+        "--sort-by": { value: { type: regex, pattern: '[A-Za-z0-9._\[\]{}\-]{1,64}' } }
+        "--show-labels": none
+    - path: [describe]
+      flags:
+        "--namespace": { value: { type: regex, pattern: '[a-z0-9][a-z0-9\-]{0,62}' } }
+        "--selector": { value: { type: regex, pattern: '[A-Za-z0-9._/=,\-]{1,128}' } }
+    - path: [logs]
+      force: ["--tail", "500"]
+      flags:
+        "--namespace": { value: { type: regex, pattern: '[a-z0-9][a-z0-9\-]{0,62}' } }
+        "--tail": { value: { type: int, min: 1, max: 2000 } }
+        "--since": { value: { type: regex, pattern: '[0-9]{1,4}[smh]' } }
+        "--container": { value: { type: regex, pattern: '[a-z0-9][a-z0-9\-]{0,62}' } }
+        "--previous": none
+        "--timestamps": none
+        "--all-containers": none
+    - path: [top, pod]
+      flags:
+        "--namespace": { value: { type: regex, pattern: '[a-z0-9][a-z0-9\-]{0,62}' } }
+        "--all-namespaces": none
+    - path: [top, node]
+    - path: [version]
+      flags: { "--output": { value: { type: enum, choices: [json, yaml]  } }, "--client": none }
+    - path: [cluster-info]
+    - path: [api-resources]
+    - path: [config, current-context]
+    - path: [config, get-contexts]
+  positionals:
+    max: 3
+    pattern: '[a-z0-9][A-Za-z0-9._/\-]{0,127}'
+    # Resource names, not subcommands — `deny_subcommands` never sees these.
+    deny:
+      secret: "returns base64-encoded credentials for the whole namespace"
+      secrets: "returns base64-encoded credentials for the whole namespace"
+      csidrivers: "exposes storage credentials"
+      serviceaccounts: "exposes token references"
+      serviceaccount: "exposes token references"
+  deny_flags:
+    "--kubeconfig": "would point kubectl at different credentials"
+    "--token": "passes a bearer token on the command line"
+    "--server": "would point kubectl at a different cluster"
+    "--as": "impersonates another user, bypassing this account's RBAC"
+    "--as-group": "impersonates another group, bypassing this account's RBAC"
+    "--insecure-skip-tls-verify": "disables TLS verification"
+    "--follow": "streams forever and would hang the connection"
+    "--watch": "streams forever and would hang the connection"
+  deny_subcommands:
+    exec: "arbitrary code execution inside a pod"
+    attach: "attaches an interactive session"
+    "port-forward": "opens a tunnel into the cluster network"
+    proxy: "opens an API proxy"
+    cp: "reads and writes arbitrary paths in a pod"
+    run: "creates workloads"
+    create: "creates resources"
+    apply: "mutates resources"
+    edit: "mutates resources"
+    patch: "mutates resources"
+    replace: "mutates resources"
+    delete: "deletes resources"
+    scale: "changes replica counts"
+    rollout: "mutates deployments"
+    drain: "evicts pods from a node"
+    cordon: "changes node scheduling"
+    uncordon: "changes node scheduling"
+    taint: "changes node scheduling"
+    label: "mutates resources"
+    annotate: "mutates resources"
+    auth: "can mint tokens"
+    debug: "attaches a debug container"
