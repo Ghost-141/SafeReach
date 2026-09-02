@@ -434,3 +434,34 @@ safereach validate "journalctl -u nginx -n 200" --host myserver
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+## Releasing
+
+Pushing or merging to `main` runs CI. **It does not publish.** Publishing happens only
+when you cut a GitHub Release, which is deliberate: for a tool holding production SSH
+keys, every merge becoming an installable artifact means an unreviewed commit reaches
+users the moment it lands.
+
+```bash
+# 1. bump the version — the tag and pyproject.toml must agree
+sed -i 's/^version = .*/version = "0.1.1"/' pyproject.toml
+git commit -am "Release 0.1.1" && git push
+
+# 2. tag and release
+gh release create v0.1.1 --generate-notes
+```
+
+The release workflow then, in order: checks the tag matches `pyproject.toml`, checks the
+version is not already on PyPI, runs the spec linter and full suite, builds, verifies the
+README renders, installs the wheel into a clean environment and runs it — and only then
+uploads via Trusted Publishing (OIDC, no stored token).
+
+Any of those failing stops the release before anything is published. **PyPI versions are
+immutable**: a published `0.1.0` can never be replaced, only yanked, so the checks are
+cheaper than the mistake.
+
+`Actions → Publish → Run workflow` also allows a manual run against TestPyPI, though note
+TestPyPI carries stale dependencies (`mcp` 0.8.0.dev0, `pydantic` 1.5a1) and resolution
+will fail without `--extra-index-url https://pypi.org/simple/`.
