@@ -439,29 +439,37 @@ MIT — see [LICENSE](LICENSE).
 
 ## Releasing
 
-Pushing or merging to `main` runs CI. **It does not publish.** Publishing happens only
-when you cut a GitHub Release, which is deliberate: for a tool holding production SSH
-keys, every merge becoming an installable artifact means an unreviewed commit reaches
-users the moment it lands.
+Pushing or merging to `main` runs CI. **It does not publish.** For a tool holding
+production SSH keys, every merge becoming an installable artifact would mean an
+unreviewed commit reaching users the moment it lands.
+
+`main` is protected: changes arrive by reviewed pull request, and publishing runs only
+from `main`, only when a human presses the button.
 
 ```bash
-# 1. bump the version — the tag and pyproject.toml must agree
+# 1. bump the version on a branch, and merge it through review
+git switch -c release-0.1.1
 sed -i 's/^version = .*/version = "0.1.1"/' pyproject.toml
-git commit -am "Release 0.1.1" && git push
+git commit -am "Release 0.1.1" && git push -u origin release-0.1.1
+gh pr create --fill && gh pr merge --squash   # requires an approving review
 
-# 2. tag and release
+# 2. publish from main
+#    Actions → Publish → Run workflow → Branch: main → target: pypi
+
+# 3. tag it for the changelog (this no longer drives publishing)
 gh release create v0.1.1 --generate-notes
 ```
 
-The release workflow then, in order: checks the tag matches `pyproject.toml`, checks the
-version is not already on PyPI, runs the spec linter and full suite, builds, verifies the
-README renders, installs the wheel into a clean environment and runs it — and only then
-uploads via Trusted Publishing (OIDC, no stored token).
+The workflow refuses to run from anything but `main`, checks the version is not already
+on PyPI, runs the spec linter and full suite, builds, verifies the README renders,
+installs the wheel into a clean environment and runs it — and only then uploads via
+Trusted Publishing (OIDC, no stored token).
 
-Any of those failing stops the release before anything is published. **PyPI versions are
-immutable**: a published `0.1.0` can never be replaced, only yanked, so the checks are
-cheaper than the mistake.
+**Why dispatch rather than release-triggered:** the `pypi` environment restricts
+deployments to `main`, and GitHub evaluates that rule against the ref that triggered the
+run. A GitHub Release runs on the *tag* ref, so a release-triggered publish would be
+blocked by the very rule that protects it. Triggering from `main` keeps the trigger and
+the rule in agreement.
 
-`Actions → Publish → Run workflow` also allows a manual run against TestPyPI, though note
-TestPyPI carries stale dependencies (`mcp` 0.8.0.dev0, `pydantic` 1.5a1) and resolution
-will fail without `--extra-index-url https://pypi.org/simple/`.
+**PyPI versions are immutable** — a published `0.1.0` can never be replaced, only yanked —
+so every check above is cheaper than the mistake it prevents.

@@ -8,17 +8,23 @@ name: Publish
 # the "Environment name" on the trusted publisher, the upload is rejected — which is the
 # point. It means a workflow added to some other branch cannot publish.
 
+# Publishing is a deliberate act, run from `main`.
+#
+# The environment's deployment-branch rule is evaluated against the ref that triggered
+# the run. A GitHub Release runs on the TAG ref, not on `main` — so an environment
+# restricted to `main` would block every release with a fairly opaque message. Triggering
+# from workflow_dispatch on `main` keeps the trigger and the rule in agreement.
+#
+# Cut the GitHub Release afterwards for the changelog; it no longer drives publishing.
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       target:
         description: "Where to publish"
         required: true
-        default: testpypi
+        default: pypi
         type: choice
-        options: [testpypi, pypi]
+        options: [pypi, testpypi]
 
 permissions:
   contents: read
@@ -34,21 +40,17 @@ jobs:
       # says 0.1.0 otherwise builds and uploads 0.1.0 under a 0.2.0 release — or fails
       # much later with "file already exists", which reads like an infrastructure problem
       # rather than the version bump you forgot.
-      - name: Tag must match the package version
-        if: github.event_name == 'release'
+      - name: Must be publishing from main
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          PKG=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
-          echo "tag=$TAG  pyproject=$PKG"
-          [ "$TAG" = "$PKG" ] || {
-            echo "::error::tag $TAG does not match pyproject version $PKG — bump pyproject.toml and re-tag"
+          [ "$GITHUB_REF_NAME" = "main" ] || {
+            echo "::error::publish only from main (got $GITHUB_REF_NAME)"
             exit 1
           }
 
       # PyPI versions are immutable: a published 0.1.0 can never be replaced, only
       # yanked. Failing here is far cheaper than burning a version number.
       - name: Version must not already be on PyPI
-        if: github.event_name == 'release'
+        if: inputs.target == 'pypi'
         run: |
           PKG=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
           CODE=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/safereach/$PKG/json")
@@ -94,7 +96,7 @@ jobs:
 
   publish-testpypi:
     needs: build
-    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+    if: inputs.target == 'testpypi'
     runs-on: ubuntu-latest
     environment:
       name: testpypi
@@ -110,7 +112,7 @@ jobs:
 
   publish-pypi:
     needs: build
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    if: inputs.target == 'pypi'
     runs-on: ubuntu-latest
     environment:
       name: pypi
