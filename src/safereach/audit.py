@@ -60,6 +60,7 @@ class AuditLog:
         self,
         *,
         host: str,
+        host_id: str | None = None,
         requested: str,
         executed: str,
         exit_code: int,
@@ -70,6 +71,7 @@ class AuditLog:
         self.write(
             decision="allowed",
             host=host,
+            host_id=host_id,
             requested=requested,
             executed=executed,
             exit_code=exit_code,
@@ -78,8 +80,20 @@ class AuditLog:
             truncated=truncated,
         )
 
-    def rejected(self, *, host: str, requested: str, reason: str) -> None:
-        self.write(decision="rejected", host=host, requested=requested, reason=reason)
+    def rejected(
+        self, *, host: str, requested: str, reason: str, host_id: str | None = None
+    ) -> None:
+        self.write(
+            decision="rejected",
+            host=host,
+            host_id=host_id,
+            requested=requested,
+            reason=reason,
+        )
 
-    def error(self, *, host: str, requested: str, error: str) -> None:
-        self.write(decision="error", host=host, requested=requested, error=error)
+    def error(self, *, host: str, requested: str, error: str, host_id: str | None = None) -> None:
+        self.write(decision="error", host=host, host_id=host_id, requested=requested, error=error)
+
+    def renamed(self, *, old: str, new: str, host_id: str | None) -> None:
+        """A rename changes how every future record reads, so it belongs in the log."""
+        self.write(decision="renamed", host=new, previous_host=old, host_id=host_id)

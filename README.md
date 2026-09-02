@@ -11,7 +11,7 @@ or reach a host it wasn't granted.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
 [![MCP](https://img.shields.io/badge/MCP-2026--07--28-green)](https://modelcontextprotocol.io)
-[![Tests](https://img.shields.io/badge/tests-756%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-797%20passing-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
 ---
@@ -205,6 +205,48 @@ Needs sudo on the target once. Additionally:
 - writes an exact-match sudoers entry for enabled recipes only — never `sudo` itself
 - makes the audit log **append-only** (`chattr +a`), so the account cannot erase its trail
 
+### Naming your hosts
+
+The alias is what the agent types, what `list_hosts` shows, and what every audit record is
+keyed on — so enrolment asks:
+
+```
+Choose a name for each host (Enter accepts the suggestion):
+
+  deploy@10.0.1.5         [web-01]          > prod-web
+  bdren@203.96.189.202    [203.96.189.202]  > langfuse-prod
+```
+
+Suggestions come from the `~/.ssh/config` `Host` entry, then the first DNS label
+(`db.eu.internal` → `db`), then the raw address. Prompting is TTY-gated, so scripted and
+CI enrolment take the suggestion and never block.
+
+```bash
+safereach enroll web-01 --name prod-web        # name a single host
+safereach enroll --all --names names.yaml      # from a file
+safereach enroll --all --no-prompt             # take the suggestions
+```
+
+Rename at any time — **local only, no re-enrolment**, because the remote host never knew
+the name:
+
+```bash
+safereach rename 203.96.189.202 langfuse-prod
+safereach rename --interactive
+safereach rename --write-names names.yaml      # dump for editing
+safereach rename --from names.yaml             # apply
+```
+
+A names file may be written either way round; the direction is resolved against the hosts
+actually known, falling back to which side parses as an address. When neither settles it
+the entry is **refused** rather than guessed — a mapping read backwards points the agent
+at the wrong machine.
+
+Every host also carries a stable `id`, derived from `hostname:port` and recorded in each
+audit entry alongside the name. Renaming therefore does not sever a host's history —
+which matters, because a rename usually happens exactly when something has gone wrong and
+you want that history.
+
 ### Mode comparison
 
 | | `discover` | `enroll` | `enroll --hardened` |
@@ -324,7 +366,7 @@ control; the proxy no longer is. Leave it off unless you need it.
 ## Testing
 
 ```bash
-uv run pytest              # 756 tests
+uv run pytest              # 797 tests
 uv run ruff check .
 uv run python shim/build.py
 ```

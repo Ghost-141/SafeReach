@@ -226,7 +226,7 @@ def _validate_or_raise(app: AppContext, host: HostConfig, command: str) -> list[
     try:
         result = validate(command, app.spec, allow=host.allow or None, ctx=_host_ctx(host))
     except Rejected as rej:
-        app.audit.rejected(host=host.alias, requested=command, reason=rej.reason)
+        app.audit.rejected(host=host.alias, host_id=host.id, requested=command, reason=rej.reason)
         # ToolError is the only exception class whose message the model can read.
         raise ToolError(rej.render()) from rej
 
@@ -312,12 +312,13 @@ async def _execute(app: AppContext, host: HostConfig, command: str) -> CommandRe
     try:
         raw = await app.pool.run(host, payload)
     except SSHError as exc:
-        app.audit.error(host=host.alias, requested=command, error=str(exc))
+        app.audit.error(host=host.alias, host_id=host.id, requested=command, error=str(exc))
         raise ToolError(str(exc)) from exc
 
     result = _postprocess(host, argv, raw)
     app.audit.allowed(
         host=host.alias,
+        host_id=host.id,
         requested=command,
         executed=wire,
         exit_code=result.exit_code,
@@ -502,11 +503,12 @@ async def run_elevated(
     try:
         raw = await app.pool.run(cfg, wire)
     except SSHError as exc:
-        app.audit.error(host=cfg.alias, requested=wire, error=str(exc))
+        app.audit.error(host=cfg.alias, host_id=cfg.id, requested=wire, error=str(exc))
         raise ToolError(str(exc)) from exc
 
     app.audit.allowed(
         host=cfg.alias,
+        host_id=cfg.id,
         requested=wire,
         executed=wire,
         exit_code=raw.exit_code,
@@ -559,15 +561,18 @@ async def run_in_container(
     try:
         raw = await app.pool.run(cfg, wire)
     except SSHError as exc:
-        app.audit.error(host=cfg.alias, requested=wire, error=str(exc))
+        app.audit.error(host=cfg.alias, host_id=cfg.id, requested=wire, error=str(exc))
         raise ToolError(str(exc)) from exc
 
     if raw.exit_code == 92:
-        app.audit.rejected(host=cfg.alias, requested=wire, reason=raw.stderr.strip())
+        app.audit.rejected(
+            host=cfg.alias, host_id=cfg.id, requested=wire, reason=raw.stderr.strip()
+        )
         raise ToolError(raw.stderr.strip() or "refused by the host")
 
     app.audit.allowed(
         host=cfg.alias,
+        host_id=cfg.id,
         requested=f"exec {container}: {command}",
         executed=wire,
         exit_code=raw.exit_code,

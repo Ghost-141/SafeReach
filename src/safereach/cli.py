@@ -16,15 +16,19 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
-from . import __version__
+from . import __version__, naming
+from .audit import AuditLog
 from .config import (
     DEFAULT_CONFIG_PATH,
     HostConfig,
@@ -880,6 +884,57 @@ def _enroll_hardened(
     }
 
 
+def _resolve_enroll_names(aliases: list[str], args: argparse.Namespace) -> dict[str, str]:
+    """Decide what each host will be called, before any of them are touched.
+
+    Order of authority: an explicit --name, then a --names file, then a prompt, then the
+    suggestion. Prompting is TTY-gated so scripted and CI enrolment never blocks — the
+    regression that would make this feature actively harmful.
+    """
+    from . import discovery
+
+    resolved = {a: discovery.resolve_alias(a) for a in aliases}
+    suggestions = {
+        a: naming.suggest_alias(a if not naming.is_bare_address(a) else None, r.hostname)
+        for a, r in resolved.items()
+    }
+
+    if args.name:
+        if len(aliases) != 1:
+            say(f"{BAD} --name applies to a single host; got {len(aliases)}")
+            raise SystemExit(2)
+        return {aliases[0]: naming.validate_alias(args.name)}
+
+    if args.names:
+        mapping, notes = naming.load_names_file(
+            Path(args.names),
+            set(aliases) | {r.hostname for r in resolved.values() if r.hostname},
+        )
+        for note in notes:
+            say(f"   note: {note}")
+        out = {}
+        for a, r in resolved.items():
+            out[a] = mapping.get(a) or mapping.get(r.hostname or "") or suggestions[a]
+        return out
+
+    if args.no_prompt or not sys.stdin.isatty():
+        return suggestions
+
+    say("\nChoose a name for each host (Enter accepts the suggestion):\n")
+    out = {}
+    for a, r in resolved.items():
+        where = f"{r.user}@{r.hostname}" if r.hostname else a
+        while True:
+            answer = _prompt(f"{where:<32}", suggestions[a])
+            try:
+                out[a] = naming.validate_alias(answer, existing=set(out.values()))
+                break
+            except naming.InvalidName as exc:
+                say(f"     {exc.render()}")
+    say("")
+    return out
+
+
 def cmd_enroll(args: argparse.Namespace) -> int:
     from . import discovery
 
@@ -898,6 +953,8 @@ def cmd_enroll(args: argparse.Namespace) -> int:
     else:
         say(f"{BAD} name a host, or pass --all to enroll every reachable host")
         return 2
+
+    chosen_names = _resolve_enroll_names(aliases, args)
 
     if args.hardened:
         say("Hardened enrolment. Uses sudo on the host to create a dedicated account.")
@@ -970,8 +1027,9 @@ def cmd_enroll(args: argparse.Namespace) -> int:
         # A hardened host connects as the *diag* account, so it must never resolve
         # through ~/.ssh/config — that would silently reconnect as your own user and
         # bypass the unprivileged account entirely.
+        chosen = chosen_names.get(alias)
         if host.get("hardened"):
-            key_name = _yaml_key(host["hostname"] or alias)
+            key_name = chosen or _yaml_key(host["hostname"] or alias)
             connection = [
                 f"    hostname: {host['hostname'] or alias}",
                 f"    user: {host['user']}",
@@ -980,10 +1038,10 @@ def cmd_enroll(args: argparse.Namespace) -> int:
             if host.get("docker_host"):
                 connection.append(f"    docker_host: {host['docker_host']}")
         elif alias in config_aliases:
-            key_name = _yaml_key(alias)
+            key_name = chosen or _yaml_key(alias)
             connection = [f"    ssh_config_host: {alias}"]
         else:
-            key_name = _yaml_key(host["hostname"] or alias)
+            key_name = chosen or _yaml_key(host["hostname"] or alias)
             connection = [
                 f"    hostname: {host['hostname'] or alias}",
                 f"    user: {host['user']}",
@@ -991,6 +1049,7 @@ def cmd_enroll(args: argparse.Namespace) -> int:
             ]
         lines += [
             f"  {key_name}:",
+            f"    id: {naming.host_id(host['hostname'] or alias, host.get('port') or 22)}",
             *connection,
             f"    key: {KEY_PATH}",
             f'    description: "{host["description"]}"',
@@ -1008,6 +1067,146 @@ def cmd_enroll(args: argparse.Namespace) -> int:
     say(f"\n{OK} enrolled {len(enrolled)} host(s); wrote {dest}")
     say("\nNext:  safereach install")
     return 0
+
+
+# --------------------------------------------------------------------------------------
+# rename
+# --------------------------------------------------------------------------------------
+
+
+def _prompt(label: str, default: str) -> str:
+    """Ask on stderr, read from stdin. Non-interactive runs take the default silently.
+
+    stdout is the JSON-RPC channel in server mode, and a prompt that blocks a scripted
+    run is worse than one that never appears — so this only engages on a TTY.
+    """
+    if not sys.stdin.isatty():
+        return default
+    sys.stderr.write(f"  {label} [{default}] > ")
+    sys.stderr.flush()
+    try:
+        answer = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        sys.stderr.write("\n")
+        return default
+    return answer or default
+
+
+def _rewrite_alias(text: str, old: str, new: str) -> str:
+    """Swap one top-level host key, leaving the rest of the file untouched.
+
+    Targeted text editing rather than a YAML round-trip, for the same reason the Codex
+    TOML adapter does it: a round-trip discards the comments the file is full of.
+    """
+    pattern = re.compile(rf"^(\s{{2}}){re.escape(old)}(\s*:\s*)$", re.MULTILINE)
+    replaced, count = pattern.subn(rf"\g<1>{new}\g<2>", text)
+    if count != 1:
+        raise RuntimeError(f"expected exactly one host entry named {old!r}, found {count}")
+    return replaced
+
+
+def _apply_renames(settings: Settings, pairs: list[tuple[str, str]]) -> int:
+    """Rename hosts in place. Purely local — the remote never knew the name."""
+    path = settings.source_path
+    if path is None:
+        say(f"{BAD} no config file to rewrite")
+        return 1
+
+    text = path.read_text(encoding="utf-8")
+    taken = set(settings.hosts)
+    audit = AuditLog(settings.audit_path())
+    done = 0
+
+    for old, new in pairs:
+        if old == new:
+            continue
+        if old not in settings.hosts:
+            say(f"{WARN} {old}: no such host, skipping")
+            continue
+        try:
+            checked = naming.validate_alias(new, existing=taken - {old})
+        except naming.InvalidName as exc:
+            say(f"{BAD} {old} -> {new}: {exc.render()}")
+            continue
+
+        cfg = settings.hosts[old]
+        try:
+            text = _rewrite_alias(text, old, checked)
+        except RuntimeError as exc:
+            say(f"{BAD} {old}: {exc}")
+            continue
+
+        # The auto-generated description repeats the address; once renamed it is noise.
+        stale = f'description: "{cfg.description}"'
+        if cfg.description.endswith("(hardened)") or "@" in cfg.description:
+            text = text.replace(stale, f'description: "{cfg.description}"')
+
+        taken.discard(old)
+        taken.add(checked)
+        audit.renamed(old=old, new=checked, host_id=cfg.id)
+        say(f"{OK} {old} -> {checked}")
+        done += 1
+
+    if not done:
+        say("nothing renamed")
+        return 1
+
+    backup = path.with_suffix(path.suffix + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    shutil.copy2(path, backup)
+    path.write_text(text, encoding="utf-8")
+    say(f"\n{OK} rewrote {path} ({done} renamed; backup {backup.name})")
+    say("   No re-enrolment needed — the remote host never knew the name.")
+    return 0
+
+
+def cmd_rename(args: argparse.Namespace) -> int:
+    settings = load_settings(args.config)
+    if not settings.hosts:
+        say(f"{BAD} no hosts configured")
+        return 1
+
+    if args.write_names:
+        naming.write_names_file(settings.hosts, Path(args.write_names).expanduser())
+        say(f"{OK} wrote {args.write_names} — edit the names, then: rename --from that file")
+        return 0
+
+    pairs: list[tuple[str, str]] = []
+
+    if args.from_file:
+        known = (
+            set(settings.hosts)
+            | {h.hostname or "" for h in settings.hosts.values()}
+            | {h.ssh_config_host or "" for h in settings.hosts.values()}
+        )
+        mapping, notes = naming.load_names_file(Path(args.from_file), known - {""})
+        for note in notes:
+            say(f"   note: {note}")
+        by_identifier = {}
+        for alias, cfg in settings.hosts.items():
+            for ident in (alias, cfg.hostname, cfg.ssh_config_host):
+                if ident:
+                    by_identifier[ident] = alias
+        for identifier, new in mapping.items():
+            current = by_identifier.get(identifier)
+            if current is None:
+                say(f"{WARN} {identifier}: no configured host matches, skipping")
+                continue
+            pairs.append((current, new))
+
+    elif args.interactive or (not args.old and sys.stdin.isatty()):
+        say("Rename hosts (Enter keeps the current name):\n")
+        for alias, cfg in settings.hosts.items():
+            hint = naming.suggest_alias(cfg.ssh_config_host, cfg.hostname)
+            suggestion = alias if not naming.is_bare_address(alias) else hint
+            pairs.append((alias, _prompt(f"{cfg.hostname or alias:<24}", suggestion)))
+
+    elif args.old and args.new:
+        pairs.append((args.old, args.new))
+    else:
+        say(f"{BAD} give OLD NEW, or --from FILE, or --interactive")
+        return 2
+
+    return _apply_renames(settings, pairs)
 
 
 # --------------------------------------------------------------------------------------
@@ -1496,6 +1695,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("hosts", nargs="*", help="aliases to enroll")
     p.add_argument("--all", action="store_true", help="every reachable host in ~/.ssh/config")
     p.add_argument("--out", help="where to write hosts.yaml")
+    p.add_argument("--name", help="name for a single-host enrolment")
+    p.add_argument("--names", metavar="FILE", help="apply names from a YAML file")
+    p.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="take the suggested names without asking (implied when not a TTY)",
+    )
     p.add_argument(
         "--elevated",
         action="append",
@@ -1539,6 +1745,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-probe", action="store_true", help="skip the live connection check")
     p.add_argument("--timeout", type=int, default=8)
     p.set_defaults(func=cmd_discover)
+
+    p = sub.add_parser("rename", help="give a host a friendlier name (local only, no re-enrolment)")
+    p.add_argument("old", nargs="?", help="current host name")
+    p.add_argument("new", nargs="?", help="new host name")
+    p.add_argument("--from", dest="from_file", metavar="FILE", help="apply names from a YAML file")
+    p.add_argument("--interactive", action="store_true", help="walk every host")
+    p.add_argument("--write-names", metavar="FILE", help="dump the current names for editing")
+    p.set_defaults(func=cmd_rename)
 
     p = sub.add_parser("validate", help="check a command against the allowlist, offline")
     p.add_argument("command")

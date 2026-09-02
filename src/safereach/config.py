@@ -13,6 +13,8 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from . import naming
+
 __all__ = [
     "HostConfig",
     "Defaults",
@@ -72,6 +74,11 @@ class HostConfig(BaseModel):
     alias: str = ""
     description: str = ""
 
+    #: Stable identity, assigned at enrolment and never changed. The alias answers
+    #: "what do I call this today"; this answers "is this the same machine as last
+    #: month", so renaming a host does not sever its audit history.
+    id: str | None = None
+
     #: --- Mode A: delegate to ~/.ssh/config -------------------------------------
     #: Set this to an alias you can already `ssh` to, and hostname/user/key/port all
     #: come from OpenSSH's own resolution. This is what `discover` writes, and it is the
@@ -113,6 +120,20 @@ class HostConfig(BaseModel):
     curl_insecure: bool = False
 
     elevated: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _assign_stable_id(self) -> HostConfig:
+        """Derive the id when the config does not carry one.
+
+        Deriving rather than storing means every existing install gains audit continuity
+        with no migration step, and the value cannot drift from the machine it names —
+        the same hostname and port always produce the same id.
+        """
+        if not self.id:
+            target = self.hostname or self.ssh_config_host or self.alias
+            if target:
+                object.__setattr__(self, "id", naming.host_id(target, self.port or 22))
+        return self
 
     @model_validator(mode="after")
     def _require_one_connection_mode(self) -> HostConfig:
