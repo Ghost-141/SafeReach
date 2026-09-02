@@ -1,0 +1,90 @@
+name: Publish
+
+# Trusted Publishing (OIDC) — no API token is stored anywhere. GitHub mints a
+# short-lived identity token for this workflow, and PyPI accepts it only for the exact
+# repository, workflow filename and environment configured on the PyPI side.
+#
+# That is why the `environment:` key below matters: PyPI checks it. If it does not match
+# the "Environment name" on the trusted publisher, the upload is rejected — which is the
+# point. It means a workflow added to some other branch cannot publish.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to publish"
+        required: true
+        default: testpypi
+        type: choice
+        options: [testpypi, pypi]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.11
+      - run: uv venv --python 3.11
+      - run: uv pip install -e ".[dev]"
+
+      # Never ship a release that fails its own tests. The spec linter runs first: it
+      # fails the build if the allowlist ever permits a mutating verb.
+      - name: Spec linter
+        run: uv run pytest tests/test_spec_lint.py -q
+      - name: Full suite
+        run: uv run pytest -q
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      # A wheel that imports but cannot find its packaged commands.yaml is useless, and
+      # that failure only shows up outside the source tree.
+      - name: Smoke-test the built wheel in a clean environment
+        run: |
+          uv venv /tmp/verify
+          uv pip install --python /tmp/verify/bin/python dist/*.whl
+          /tmp/verify/bin/safereach --help
+          /tmp/verify/bin/safereach validate "journalctl -u nginx -n 5"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-testpypi:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/safereach
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    needs: build
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/safereach
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - uses: pypa/gh-action-pypi-publish@release/v1
