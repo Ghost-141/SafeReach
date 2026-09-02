@@ -23,3 +23,21 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run python shim/build.py
+
+  # A single stable check name to require in branch protection.
+  #
+  # The matrix above produces `test (3.11)`, `test (3.12)`, `test (3.13)` — three names
+  # that change whenever the matrix does, and a required check that no longer exists
+  # silently stops gating anything. This job is one name that never changes.
+  #
+  # `if: always()` matters: without it, a skipped or failed matrix leg would leave this
+  # job skipped, and GitHub treats a skipped required check as passing.
+  ci-ok:
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: All matrix legs must have succeeded
+        run: |
+          echo "test result: ${{ needs.test.result }}"
+          [ "${{ needs.test.result }}" = "success" ] || exit 1
