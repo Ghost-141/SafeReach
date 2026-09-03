@@ -475,45 +475,39 @@ safereach validate "journalctl -u nginx -n 200" --host myserver
 
 ---
 
+## Releasing
+
+Publishing is automatic, and triggered by the **version number**, not by merging.
+
+```bash
+git switch -c release-0.1.1
+sed -i 's/^version = .*/version = "0.1.1"/' pyproject.toml
+gh pr create --fill        # merge through review as usual
+```
+
+When that PR merges, the publish workflow sees `pyproject.toml` changed, compares the
+version against the previous commit, confirms it is not already on PyPI, then runs the
+spec linter, the full suite, lint, format check, the build, a README render check, and a
+clean-environment install of the built wheel — and only then uploads. The GitHub release
+is tagged afterwards, so a tag always names something that is actually installable.
+
+Merging anything that does not change the version is silently a no-op.
+
+**Why gate on the version rather than publish on every merge:** PyPI versions are
+immutable. The first merge that did not bump the version would fail with "file already
+exists", and CI would stay red from then on.
+
+Uploads use **Trusted Publishing** (OIDC) with PEP 740 attestations — no API token is
+stored anywhere, and each artifact is cryptographically bound to the commit and workflow
+that produced it. That matters for a package people install and then point at their own
+production servers; the attestation is shown on the PyPI project page.
+
+`Actions → Publish → Run workflow` still allows a manual run, including to TestPyPI.
+
+---
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
 
 ---
-
-## Releasing
-
-Pushing or merging to `main` runs CI. **It does not publish.** For a tool holding
-production SSH keys, every merge becoming an installable artifact would mean an
-unreviewed commit reaching users the moment it lands.
-
-`main` is protected: changes arrive by reviewed pull request, and publishing runs only
-from `main`, only when a human presses the button.
-
-```bash
-# 1. bump the version on a branch, and merge it through review
-git switch -c release-0.1.1
-sed -i 's/^version = .*/version = "0.1.1"/' pyproject.toml
-git commit -am "Release 0.1.1" && git push -u origin release-0.1.1
-gh pr create --fill && gh pr merge --squash   # requires an approving review
-
-# 2. publish from main
-#    Actions → Publish → Run workflow → Branch: main → target: pypi
-
-# 3. tag it for the changelog (this no longer drives publishing)
-gh release create v0.1.1 --generate-notes
-```
-
-The workflow refuses to run from anything but `main`, checks the version is not already
-on PyPI, runs the spec linter and full suite, builds, verifies the README renders,
-installs the wheel into a clean environment and runs it — and only then uploads via
-Trusted Publishing (OIDC, no stored token).
-
-**Why dispatch rather than release-triggered:** the `pypi` environment restricts
-deployments to `main`, and GitHub evaluates that rule against the ref that triggered the
-run. A GitHub Release runs on the *tag* ref, so a release-triggered publish would be
-blocked by the very rule that protects it. Triggering from `main` keeps the trigger and
-the rule in agreement.
-
-**PyPI versions are immutable** — a published `0.1.0` can never be replaced, only yanked —
-so every check above is cheaper than the mistake it prevents.
