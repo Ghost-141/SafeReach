@@ -19,8 +19,8 @@ or reach a host it wasn't granted.
 ## Quick start
 
 ```bash
-uvx safereach@0.1.1 enroll --all      # set up every server you can already ssh to
-uvx safereach@0.1.1 install           # register with your agents
+uvx safereach@0.1.2 enroll --all      # set up every server you can already ssh to
+uvx safereach@0.1.2 install           # register with your agents
 ```
 
 > **Pre-release:** until this is on PyPI, install from source and register with
@@ -131,7 +131,7 @@ the socket proxy. A proxy bug lands on an account that cannot do much anyway.
 ### Recommended — `uvx`, pinned
 
 ```bash
-uvx safereach@0.1.1 --help
+uvx safereach@0.1.2 --help
 ```
 
 Nothing installed globally, and it is the one launch form that works identically for every
@@ -147,7 +147,7 @@ recommended.
 ### Alternative — a persistent install
 
 ```bash
-uv tool install safereach==0.1.1
+uv tool install safereach==0.1.2
 ```
 
 ### From source
@@ -392,6 +392,17 @@ proves only that the input was empty.
 ---
 
 ## Release notes
+
+### 0.1.2
+
+- `--version` reported `0.1.0` from the 0.1.1 package. `__version__` was a hard-coded
+  literal alongside the one in `pyproject.toml`, and the two drifted.
+- That mattered beyond the banner: `install` pins agents to `__version__`, so installing
+  0.1.1 would have written `uvx safereach@0.1.0` into every agent's config — wiring them
+  to the previous release.
+- `__version__` is now read from installed package metadata, so it cannot disagree with
+  the wheel it came from. Two tests hold it: one comparing against `pyproject.toml`, one
+  asserting the registration pins the running version.
 
 ### 0.1.1
 

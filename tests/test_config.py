@@ -118,3 +118,36 @@ def test_fingerprint_changes_when_spec_changes() -> None:
     before = fingerprint(spec)
     mutated = {**spec, "newtool": {"description": "x", "positionals": {"max": 0}}}
     assert fingerprint(mutated) != before
+
+
+def test_version_is_derived_not_duplicated() -> None:
+    """__version__ must come from package metadata, not a literal.
+
+    A hard-coded copy drifts: 0.1.1 shipped reporting 0.1.0, and since `install` pins
+    agents to __version__, it would have wired every agent to the previous release.
+    """
+    import tomllib
+    from pathlib import Path
+
+    from safereach import __version__
+
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+
+    assert __version__ == declared, (
+        f"__version__ is {__version__!r} but pyproject.toml says {declared!r}.\n\n"
+        "If you just bumped the version, the installed metadata is stale — run\n"
+        "    uv pip install -e '.[dev]'\n"
+        "and re-run. In CI the install always follows the checkout, so a failure there\n"
+        "means the two really have drifted, and the package would report and pin the\n"
+        "wrong version."
+    )
+
+
+def test_agent_registration_pins_the_running_version() -> None:
+    """`install` writes `uvx safereach@<version>`; it must be the version in use."""
+    from safereach import __version__
+    from safereach.install.adapters import resolve_command
+
+    spec = resolve_command(mode="uvx", version=__version__)
+    assert spec.args == [f"safereach@{__version__}"]
