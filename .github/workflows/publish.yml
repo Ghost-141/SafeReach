@@ -1,22 +1,21 @@
 name: Publish
 
-# Trusted Publishing (OIDC) — no API token is stored anywhere. GitHub mints a
-# short-lived identity token for this workflow, and PyPI accepts it only for the exact
-# repository, workflow filename and environment configured on the PyPI side.
+# Publishing is automatic, but only when the version actually changes.
 #
-# That is why the `environment:` key below matters: PyPI checks it. If it does not match
-# the "Environment name" on the trusted publisher, the upload is rejected — which is the
-# point. It means a workflow added to some other branch cannot publish.
+# Publishing on every merge cannot work: PyPI versions are immutable, so the first merge
+# that does not bump the version fails with "file already exists" and CI stays red from
+# then on. Gating on a version change means merging a bump publishes, and merging
+# anything else is silently a no-op.
+#
+# The full suite runs again here rather than trusting ci.yml. That is deliberate: it
+# makes the job self-contained, removes a race between two workflows, and means nothing
+# reaches PyPI without its tests having passed in the same run that uploaded it.
 
-# Publishing is a deliberate act, run from `main`.
-#
-# The environment's deployment-branch rule is evaluated against the ref that triggered
-# the run. A GitHub Release runs on the TAG ref, not on `main` — so an environment
-# restricted to `main` would block every release with a fairly opaque message. Triggering
-# from workflow_dispatch on `main` keeps the trigger and the rule in agreement.
-#
-# Cut the GitHub Release afterwards for the changelog; it no longer drives publishing.
 on:
+  push:
+    branches: [main]
+    # Cheap pre-filter; the real decision is the version comparison below.
+    paths: ["pyproject.toml"]
   workflow_dispatch:
     inputs:
       target:
@@ -30,63 +29,84 @@ permissions:
   contents: read
 
 jobs:
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # need the previous commit to compare against
+
+      - id: check
+        name: Publish only if the version changed and is not already on PyPI
+        run: |
+          VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual run — publishing $VERSION"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PREVIOUS=$(git show HEAD~1:pyproject.toml 2>/dev/null \
+                     | grep -m1 '^version = ' | cut -d'"' -f2 || echo "")
+          if [ "$VERSION" = "$PREVIOUS" ]; then
+            echo "version unchanged ($VERSION) — nothing to publish"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A version can be bumped on a branch and published manually before the merge
+          # lands. Re-uploading would fail late and noisily; skipping is correct.
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+                 "https://pypi.org/pypi/safereach/$VERSION/json")
+          if [ "$CODE" != "404" ]; then
+            echo "$VERSION is already on PyPI — nothing to publish"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "version changed ${PREVIOUS:-none} -> $VERSION, publishing"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: decide
+    if: needs.decide.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-
-      # The tag and pyproject version must agree. Tagging v0.2.0 while pyproject still
-      # says 0.1.0 otherwise builds and uploads 0.1.0 under a 0.2.0 release — or fails
-      # much later with "file already exists", which reads like an infrastructure problem
-      # rather than the version bump you forgot.
-      - name: Must be publishing from main
-        run: |
-          [ "$GITHUB_REF_NAME" = "main" ] || {
-            echo "::error::publish only from main (got $GITHUB_REF_NAME)"
-            exit 1
-          }
-
-      # PyPI versions are immutable: a published 0.1.0 can never be replaced, only
-      # yanked. Failing here is far cheaper than burning a version number.
-      - name: Version must not already be on PyPI
-        if: inputs.target == 'pypi'
-        run: |
-          PKG=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
-          CODE=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/safereach/$PKG/json")
-          [ "$CODE" = "404" ] || {
-            echo "::error::safereach $PKG is already published — bump the version"
-            exit 1
-          }
-
       - run: uv python install 3.11
       - run: uv venv --python 3.11
       - run: uv pip install -e ".[dev]"
 
-      # Never ship a release that fails its own tests. The spec linter runs first: it
-      # fails the build if the allowlist ever permits a mutating verb.
+      # The spec linter first: it fails the build if the allowlist ever permits a
+      # mutating verb, and that is the cheapest thing to learn early.
       - name: Spec linter
         run: uv run pytest tests/test_spec_lint.py -q
       - name: Full suite
         run: uv run pytest -q
       - name: Lint
         run: uv run ruff check .
+      - name: Format
+        run: uv run ruff format --check .
 
       - name: Build sdist and wheel
         run: uv build
 
-      # PyPI rejects a malformed long_description at upload time; catching it here is
-      # the one gap that skipping TestPyPI would otherwise leave.
       - name: README must render on PyPI
         run: uv run --with twine twine check dist/*
 
       # A wheel that imports but cannot find its packaged commands.yaml is useless, and
-      # that failure only shows up outside the source tree.
-      - name: Smoke-test the built wheel in a clean environment
+      # that only fails outside the source tree.
+      - name: Smoke-test the wheel in a clean environment
         run: |
           uv venv /tmp/verify
           uv pip install --python /tmp/verify/bin/python dist/*.whl
-          /tmp/verify/bin/safereach --help
+          /tmp/verify/bin/safereach --version
           /tmp/verify/bin/safereach validate "journalctl -u nginx -n 5"
 
       - uses: actions/upload-artifact@v4
@@ -95,8 +115,8 @@ jobs:
           path: dist/
 
   publish-testpypi:
-    needs: build
-    if: inputs.target == 'testpypi'
+    needs: [decide, build]
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
     runs-on: ubuntu-latest
     environment:
       name: testpypi
@@ -109,17 +129,38 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
+          attestations: true
 
   publish-pypi:
-    needs: build
-    if: inputs.target == 'pypi'
+    needs: [decide, build]
+    if: github.event_name == 'push' || inputs.target == 'pypi'
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/safereach
     permissions:
       id-token: write
+      contents: write # for the release tag created below
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: dist, path: dist }
+
+      # Trusted Publishing: no stored token. GitHub mints a short-lived identity that
+      # PyPI accepts only for this repository, workflow and environment. `attestations`
+      # additionally binds the artifact to the commit that produced it, so a user can
+      # verify what they are about to run against their own servers.
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
+
+      # Tagged only after a successful upload, so a tag always names something that is
+      # actually installable.
+      - name: Tag the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          gh release create "v$VERSION" dist/* \
+            --title "v$VERSION" \
+            --generate-notes
