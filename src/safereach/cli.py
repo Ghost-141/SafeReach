@@ -293,9 +293,37 @@ DEFAULT_ALLOW = [
 KEY_DIR = DEFAULT_CONFIG_PATH.parent / "keys"
 KEY_PATH = KEY_DIR / "id_ed25519_safereach"
 
-#: Marker comment on the authorized_keys entry. Used to find and replace our own line on
-#: re-enrolment without touching anything else in the file.
+#: Comment written on the authorized_keys entry. Human-readable only.
 KEY_COMMENT = "safereach-enrolled"
+
+#: Comments used by earlier versions. Kept so their entries can still be found and
+#: replaced rather than silently duplicated.
+LEGACY_KEY_COMMENTS = ("ssh-diag-mcp-enrolled",)
+
+
+def _authorized_key_markers() -> list[str]:
+    """Strings that identify our entry in a remote authorized_keys file.
+
+    The **key material** comes first, and is the one that matters. Identifying our line by
+    its comment looked fine until the project was renamed: the comment is baked into the
+    keypair at generation time, so a key generated before the rename still carried the old
+    one. `grep -v safereach-enrolled` then matched nothing — re-enrolment appended a
+    duplicate, and a revoke would have found nothing to remove and reported success.
+
+    The base64 key material cannot drift like that. It *is* the identity of the grant, and
+    it is what sshd matches on. The comments are kept only as a fallback for entries whose
+    private key we no longer hold.
+    """
+    markers: list[str] = []
+    pub = Path(str(KEY_PATH) + ".pub")
+    if pub.is_file():
+        parts = pub.read_text(encoding="utf-8").split()
+        if len(parts) >= 2:
+            markers.append(parts[1])  # the base64 blob, not the type or comment
+    markers.append(KEY_COMMENT)
+    markers.extend(LEGACY_KEY_COMMENTS)
+    return markers
+
 
 #: Paths the agent may never name, in any command, on any host. Enforced against every
 #: argument token rather than only positionals — a path can arrive as a flag value too.
@@ -430,7 +458,8 @@ rm -f /tmp/.safereach-shim.conf.upload
 HOME_DIR=$(getent passwd "$DIAG_USER" | cut -d: -f6)
 mkdir -p "$HOME_DIR/.ssh"
 touch "$HOME_DIR/.ssh/authorized_keys"
-grep -v '{marker}' "$HOME_DIR/.ssh/authorized_keys" > "$HOME_DIR/.ssh/.ak.new" 2>/dev/null || true
+cp "$HOME_DIR/.ssh/authorized_keys" "$HOME_DIR/.ssh/.ak.new"
+{strip}
 cat >> "$HOME_DIR/.ssh/.ak.new" <<'DIAGKEY'
 {authkey}
 DIAGKEY
@@ -494,7 +523,8 @@ rm -f /tmp/.safereach-shim.conf.upload
 touch "$HOME/.ssh/authorized_keys"
 # Replace only our own previous entry. Every other key in this file is left byte for
 # byte alone — including the one being used to run this script.
-grep -v '{marker}' "$HOME/.ssh/authorized_keys" > "$HOME/.ssh/.ak.new" || true
+cp "$HOME/.ssh/authorized_keys" "$HOME/.ssh/.ak.new"
+{strip}
 cat >> "$HOME/.ssh/.ak.new" <<'DIAGKEY'
 {authkey}
 DIAGKEY
@@ -509,6 +539,18 @@ echo "SHIM=$("$HOME/.local/bin/safereach-shim" --version)"
 def _yaml_key(name: str) -> str:
     """An alias the agent can address. `user@host` is not usable as one."""
     return name.split("@")[-1]
+
+
+def _strip_markers_sh(target: str) -> str:
+    """Shell that removes every line matching any of our markers, in place."""
+    lines = []
+    for marker in _authorized_key_markers():
+        safe = marker.replace("'", "'\\''")
+        lines.append(
+            f"grep -vF '{safe}' {target} > {target}.tmp 2>/dev/null || true\n"
+            f"mv {target}.tmp {target}"
+        )
+    return "\n".join(lines)
 
 
 def _ensure_local_key() -> Path:
@@ -598,7 +640,9 @@ def _enroll_one(
                 say(f"{BAD} {alias}: upload failed: {up.stderr.strip()}")
                 return None
 
-        script = ENROLL_SCRIPT.format(marker=KEY_COMMENT, authkey=entry)
+        script = ENROLL_SCRIPT.format(
+            strip=_strip_markers_sh('"$HOME/.ssh/.ak.new"'), authkey=entry
+        )
         run = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", alias, "bash -s"],
             input=script,
@@ -812,7 +856,7 @@ def _enroll_hardened(
         )
         script = HARDENED_SCRIPT.format(
             diag_user=diag_user,
-            marker=KEY_COMMENT,
+            strip=_strip_markers_sh('"$HOME_DIR/.ssh/.ak.new"'),
             authkey=authkey,
             sudoers_block=_sudoers_block(elevated),
         )
