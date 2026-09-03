@@ -19,7 +19,13 @@ from pathlib import Path
 
 import pytest
 
-from safereach.cli import ENROLL_SCRIPT, KEY_COMMENT
+from safereach.cli import (
+    ENROLL_SCRIPT,
+    KEY_COMMENT,
+    LEGACY_KEY_COMMENTS,
+    _authorized_key_markers,
+    _strip_markers_sh,
+)
 
 EXISTING_KEYS = """\
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExistingLaptopKey me@laptop
@@ -48,7 +54,10 @@ def fake_home(tmp_path: Path, shim_path: Path) -> Path:
 
 
 def run_enroll_script(home: Path) -> subprocess.CompletedProcess:
-    script = ENROLL_SCRIPT.format(marker=KEY_COMMENT, authkey=AUTHKEY_LINE.format(home=home))
+    script = ENROLL_SCRIPT.format(
+        strip=_strip_markers_sh('"$HOME/.ssh/.ak.new"'),
+        authkey=AUTHKEY_LINE.format(home=home),
+    )
     return subprocess.run(
         ["bash", "-s"],
         input=script,
@@ -191,3 +200,76 @@ def test_explicit_host_config_round_trips(tmp_path: Path) -> None:
     assert host.user == "deploy"
     assert not host.uses_ssh_config
     assert host.ssh_port(load_settings(path).defaults) == 2222
+
+
+# --------------------------------------------------------------------------------------
+# Identifying our own entry
+# --------------------------------------------------------------------------------------
+
+
+def test_a_legacy_comment_entry_is_replaced_not_duplicated(fake_home: Path) -> None:
+    """The bug this guards against shipped, and it is the worst kind: silent.
+
+    Our entry used to be found by its comment. The comment is baked into the keypair at
+    generation time, so after the project was renamed a key generated earlier still
+    carried the old comment — `grep -v safereach-enrolled` matched nothing. Re-enrolment
+    appended a duplicate, and a revoke would have found nothing to remove and reported
+    success. Matching on the key material instead cannot drift that way.
+    """
+    auth = fake_home / ".ssh" / "authorized_keys"
+    legacy = (
+        'command="/x/diag-shim",no-pty ssh-ed25519 '
+        "AAAAC3NzaC1lZDI1NTE5AAAADiagKey " + LEGACY_KEY_COMMENTS[0]
+    )
+    auth.write_text(EXISTING_KEYS + legacy + "\n", encoding="utf-8")
+
+    run_enroll_script(fake_home)
+    content = auth.read_text(encoding="utf-8")
+
+    ours = [
+        line
+        for line in content.splitlines()
+        if KEY_COMMENT in line or any(c in line for c in LEGACY_KEY_COMMENTS)
+    ]
+    assert len(ours) == 1, f"expected one entry of ours, got {len(ours)}:\n{content}"
+    for line in EXISTING_KEYS.strip().splitlines():
+        assert line in content, "an unrelated key was lost"
+
+
+def test_markers_prefer_key_material_over_the_comment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The key material is the identity of the grant; a comment is a label.
+
+    The key path is redirected at a fixture rather than read from the developer's real
+    config. The first version of this test asserted against whatever key happened to be
+    installed, so it passed locally and failed on CI — where no key exists.
+    """
+    key = tmp_path / "id_ed25519_safereach"
+    (tmp_path / "id_ed25519_safereach.pub").write_text(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITESTKEYMATERIAL safereach-enrolled\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("safereach.cli.KEY_PATH", key)
+
+    markers = _authorized_key_markers()
+    assert markers[0] == "AAAAC3NzaC1lZDI1NTE5AAAAITESTKEYMATERIAL", (
+        "the base64 key blob must be tried first — it is what sshd matches on"
+    )
+    assert KEY_COMMENT in markers
+    assert all(c in markers for c in LEGACY_KEY_COMMENTS)
+
+
+def test_markers_fall_back_to_comments_with_no_local_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After `revoke` deletes the private key, entries must still be strippable.
+
+    The key material is unavailable at exactly the moment cleanup matters most, so the
+    comment markers are the fallback rather than a nicety.
+    """
+    monkeypatch.setattr("safereach.cli.KEY_PATH", tmp_path / "absent")
+
+    markers = _authorized_key_markers()
+    assert markers == [KEY_COMMENT, *LEGACY_KEY_COMMENTS]
+    assert not any(m.startswith("AAAA") for m in markers)
