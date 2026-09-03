@@ -1,9 +1,11 @@
 *.bak-*
 build/
+.coverage
 dist/
 docs/
 *.egg-info/
 hosts.yaml
+htmlcov/
 __pycache__/
 *.py[cod]
 .pytest_cache/
