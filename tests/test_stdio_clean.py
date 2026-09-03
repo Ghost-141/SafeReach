@@ -9,6 +9,7 @@ tempting to add.
 
 from __future__ import annotations
 
+import argparse
 import json
 import queue
 import subprocess
@@ -284,6 +285,132 @@ def test_help_does_not_start_the_server() -> None:
         check=False,
     )
     combined = proc.stdout + proc.stderr
-    assert "usage:" in combined
+    assert "SafeReach" in combined
+    assert "Quick start" in combined
     assert "discover" in combined
     assert "Traceback" not in combined
+
+
+def test_bare_invocation_on_a_tty_shows_help_not_a_silent_server() -> None:
+    """A human typing `safereach` should not watch a server wait on stdin forever.
+
+    Agents launch it over a pipe, never a TTY, so the two cases are distinguishable —
+    and `test_stdout_is_pure_jsonrpc` above proves the pipe case still starts a server.
+    """
+    proc = subprocess.run(
+        ["script", "-qec", f"{sys.executable} -m safereach", "/dev/null"],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), "PYTHONPATH": str(REPO / "src")},
+        timeout=30,
+        check=False,
+    )
+    combined = proc.stdout + proc.stderr
+    assert "SafeReach" in combined
+    assert "Quick start" in combined, "the grouped listing should be what a human sees"
+    assert "enroll" in combined and "doctor" in combined
+
+
+def test_help_groups_commands_by_task() -> None:
+    """The generated list says which commands exist; the grouping says which to run."""
+    from safereach.cli import COMMAND_GROUPS
+
+    titles = [title for title, _ in COMMAND_GROUPS]
+    assert titles == ["Setting up servers", "Connecting agents", "Checking and debugging"]
+
+    listed = {cmd for _, rows in COMMAND_GROUPS for cmd, _ in rows}
+    assert {"enroll", "install", "doctor", "rename", "validate"} <= listed
+    for _, rows in COMMAND_GROUPS:
+        for cmd, description in rows:
+            assert description and not description.endswith("."), (
+                f"{cmd}: descriptions read as labels, not sentences"
+            )
+
+
+def test_every_subcommand_explains_itself() -> None:
+    """`help=` only ever fed the parent listing, so per-command help had no description."""
+    from safereach.cli import build_parser
+
+    sub = next(
+        a for a in build_parser()._actions if isinstance(a, argparse.__dict__["_SubParsersAction"])
+    )
+    for name, parser in sub.choices.items():
+        assert parser.description, f"`safereach {name} --help` has no description"
+
+
+# --------------------------------------------------------------------------------------
+# Rich output must never reach stdout
+# --------------------------------------------------------------------------------------
+
+
+def test_rich_console_is_bound_to_stderr() -> None:
+    """The single rule that makes coloured output safe in an MCP server.
+
+    stdout carries JSON-RPC. rich writes to stdout by default, so one styled line there
+    corrupts the stream and every agent reports an opaque parse failure with no clue
+    where it came from. Binding the console once is the guarantee; this asserts it.
+    """
+    from safereach.console import console
+
+    assert console.stderr is True, "the shared console must never write to stdout"
+
+
+@pytest.mark.parametrize("command", [["--help"], ["install", "--list"], ["validate", "df -h"]])
+def test_cli_commands_write_nothing_to_stdout(command: list[str]) -> None:
+    """Every human-facing command keeps stdout empty, tables included."""
+    proc = subprocess.run(
+        [sys.executable, "-m", "safereach", *command],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), "PYTHONPATH": str(REPO / "src")},
+        timeout=60,
+        check=False,
+    )
+    assert proc.stdout == "", (
+        f"`safereach {' '.join(command)}` wrote to stdout, which is the protocol "
+        f"channel:\n{proc.stdout[:400]}"
+    )
+    assert proc.stderr.strip(), "output should still be produced, on stderr"
+
+
+def test_colour_is_dropped_when_piped() -> None:
+    """Piped output must stay greppable — `safereach doctor | tee log` is normal usage."""
+    proc = subprocess.run(
+        [sys.executable, "-m", "safereach", "install", "--list"],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), "PYTHONPATH": str(REPO / "src")},
+        timeout=60,
+        check=False,
+    )
+    assert "\x1b[" not in proc.stderr, "ANSI escapes leaked into non-TTY output"
+    assert "Claude Code" in proc.stderr, "the content itself must survive"
+
+
+def test_no_color_env_is_honoured() -> None:
+    """Users who set NO_COLOR expect it obeyed everywhere, not just where convenient."""
+    proc = subprocess.run(
+        [sys.executable, "-m", "safereach", "--help"],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(Path.home()),
+            "PYTHONPATH": str(REPO / "src"),
+            "NO_COLOR": "1",
+        },
+        timeout=60,
+        check=False,
+    )
+    assert "\x1b[" not in proc.stderr
+
+
+def test_shim_bundle_never_imports_rich() -> None:
+    """rich is a CLI dependency; the shim must stay stdlib-only to remain scp-able."""
+    for module in ("validator.py", "redact.py"):
+        source = (REPO / "src" / "safereach" / module).read_text(encoding="utf-8")
+        assert "rich" not in source, f"{module} must not depend on rich"
