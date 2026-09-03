@@ -20,6 +20,7 @@ dependencies = [
     "asyncssh>=2.24",
     "pydantic>=2.9",
     "PyYAML>=6.0",
+    "rich>=15.0.0",
 ]
 
 [project.optional-dependencies]

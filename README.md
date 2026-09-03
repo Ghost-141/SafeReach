@@ -11,7 +11,7 @@ or reach a host it wasn't granted.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
 [![MCP](https://img.shields.io/badge/MCP-2026--07--28-green)](https://modelcontextprotocol.io)
-[![Tests](https://img.shields.io/badge/tests-825%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-832%20passing-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
 ---
@@ -366,7 +366,7 @@ control; the proxy no longer is. Leave it off unless you need it.
 ## Testing
 
 ```bash
-uv run pytest              # 825 tests
+uv run pytest              # 832 tests
 uv run ruff check .
 uv run python shim/build.py
 ```

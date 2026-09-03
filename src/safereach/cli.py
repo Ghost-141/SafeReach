@@ -37,6 +37,7 @@ from .config import (
     load_settings,
     resolve_data_file,
 )
+from .console import console, status_mark, status_table
 from .install import adapters as ad
 from .ssh import SSHError, SSHPool
 from .validator import Rejected, render, validate
@@ -48,8 +49,12 @@ BAD = "XX"
 
 
 def say(*parts: Any) -> None:
-    """Human-facing output. Always stderr — stdout belongs to the protocol."""
-    print(*parts, file=sys.stderr)
+    """Human-facing output. Always stderr — stdout belongs to the protocol.
+
+    Routed through the shared console so markup composes with the tables, and so there
+    is exactly one place that could ever be pointed at the wrong stream.
+    """
+    console.print(" ".join(str(p) for p in parts), markup=True, highlight=False)
 
 
 # --------------------------------------------------------------------------------------
@@ -82,12 +87,16 @@ def cmd_install(args: argparse.Namespace) -> int:
     detected = ad.detect_all()
 
     if args.list:
-        say("Detected agents:")
+        table = status_table("", "Agent", "Config", title="Detected agents")
         for adapter in ad.ADAPTERS.values():
-            mark = OK if adapter in detected else "  "
             path = adapter.config_path()
-            where = str(path) if path else f"via `{adapter.name}` CLI"
-            say(f"  [{mark}] {adapter.label:<20} {where}")
+            where = str(path) if path else f"via the `{adapter.name}` CLI"
+            table.add_row(
+                status_mark("ok") if adapter in detected else "[muted]--[/muted]",
+                adapter.label,
+                f"[path]{where}[/path]" if adapter in detected else f"[muted]{where}[/muted]",
+            )
+        console.print(table)
         return 0
 
     if args.agents:
@@ -178,19 +187,26 @@ def cmd_discover(args: argparse.Namespace) -> int:
     found = discovery.discover(aliases=candidates, probe=not args.no_probe, timeout=args.timeout)
 
     usable = []
+    table = status_table("", "Alias", "Target", "Result")
     for host in found:
-        mark = {
-            "ok": OK,
-            "unknown": "  ",
-            "auth-failed": WARN,
-            "unknown-host-key": WARN,
-            "unreachable": WARN,
-            "error": BAD,
-        }.get(host.status, BAD)
+        status = {
+            "ok": "ok",
+            "unknown": "skip",
+            "auth-failed": "warn",
+            "unknown-host-key": "warn",
+            "unreachable": "warn",
+            "error": "bad",
+        }.get(host.status, "bad")
         where = f"{host.user}@{host.hostname}" if host.hostname else "?"
-        say(f"{mark} {host.alias:<24} {where:<34} {host.detail}")
+        table.add_row(
+            status_mark(status),
+            f"[host]{host.alias}[/host]",
+            f"[muted]{where}[/muted]",
+            host.detail,
+        )
         if host.usable or args.no_probe:
             usable.append(host)
+    console.print(table)
 
     if not usable:
         say(f"\n{WARN} nothing usable found.")
@@ -1421,11 +1437,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if not settings.hosts:
         return 1 if problems else 0
 
-    say("\nConnectivity:")
-    for mark, alias, detail in asyncio.run(_probe_hosts(settings, expected, fix=args.fix)):
-        say(f"{mark} {alias}: {detail}")
-        if mark != OK:
+    console.print()
+    table = status_table("", "Host", "Status", title="Connectivity")
+    for marker, alias, detail in asyncio.run(_probe_hosts(settings, expected, fix=args.fix)):
+        status = {OK: "ok", WARN: "warn"}.get(marker, "bad")
+        table.add_row(status_mark(status), f"[host]{alias}[/host]", detail)
+        if marker != OK:
             problems += 1
+    console.print(table)
 
     say("")
     say(f"{OK} no problems found" if not problems else f"{WARN} {problems} problem(s) above")
@@ -1741,6 +1760,79 @@ SUBCOMMAND_DESCRIPTIONS = {
 }
 
 
+COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
+    (
+        "Setting up servers",
+        [
+            ("enroll", "add hosts over your existing SSH access (no sudo)"),
+            ("discover", "show what is reachable, changing nothing"),
+            ("provision", "create a dedicated unprivileged account on a host"),
+            ("rename", "give a host a friendlier name (local, no re-enrol)"),
+            ("shim-update", "redeploy the remote validator after a spec change"),
+        ],
+    ),
+    (
+        "Connecting agents",
+        [
+            ("install", "register this server with your AI agents"),
+            ("uninstall", "remove that registration"),
+        ],
+    ),
+    (
+        "Checking and debugging",
+        [
+            ("doctor", "verify config, keys, connectivity, shim versions"),
+            ("validate", "test a command against the allowlist, offline"),
+            ("init", "write a starter hosts.yaml"),
+        ],
+    ),
+]
+
+
+def print_rich_help() -> None:
+    """Draw the top-level help as grouped tables.
+
+    argparse renders one flat alphabetical list, which says the commands exist but not
+    which to run first — the only question a new user has. Grouping by task, with a
+    quickstart above it, answers that in the first five lines.
+    """
+    console.print()
+    console.print(
+        "[heading]SafeReach[/heading] [muted]— read-only production diagnostics over SSH, for AI agents[/muted]"
+    )
+    console.print()
+    console.print(
+        "  Gives an agent a read-only view of your servers — logs, services, disk,\n"
+        "  containers, endpoints — while making destructive commands and secret\n"
+        "  disclosure [bold]structurally impossible[/bold] rather than merely discouraged.",
+        style="",
+    )
+    console.print()
+
+    quick = status_table("", "", title="Quick start")
+    for cmd, what in [
+        ("safereach enroll --all", "set up every server you can already ssh to"),
+        ("safereach install", "register with Claude Code, Codex, Cursor, ..."),
+        ("safereach doctor", "check that it all works"),
+    ]:
+        quick.add_row(f"[cmd]{cmd}[/cmd]", f"[muted]{what}[/muted]")
+    console.print(quick)
+
+    for title, rows in COMMAND_GROUPS:
+        table = status_table("", "", title=title)
+        for cmd, what in rows:
+            table.add_row(f"[cmd]{cmd}[/cmd]", f"[muted]{what}[/muted]")
+        console.print(table)
+
+    console.print(
+        "  [cmd]safereach <command> --help[/cmd]   [muted]details for any command[/muted]"
+    )
+    console.print(
+        "\n  [muted]With no arguments safereach runs as an MCP server over stdio — how agents\n"
+        "  launch it. You rarely need to run it that way yourself.[/muted]\n"
+    )
+
+
 def _describe_subcommands(sub: argparse._SubParsersAction) -> None:
     """Give each subcommand its own --help text, and hide the flat list.
 
@@ -1925,6 +2017,11 @@ def _is_server_invocation(args: list[str]) -> bool:
 def main(argv: list[str] | None = None) -> int:
     args_list = sys.argv[1:] if argv is None else argv
 
+    # argparse would print its own plain-text help here.
+    if args_list and args_list[0] in {"-h", "--help"}:
+        print_rich_help()
+        return 0
+
     # Server mode is the no-subcommand default, and it has to be decided before argparse
     # so that a bare `safereach --config X` is not answered with a usage message on
     # stdout — which would corrupt the JSON-RPC stream.
@@ -1935,9 +2032,11 @@ def main(argv: list[str] | None = None) -> int:
     # for hosts.yaml.
     if _is_server_invocation(args_list):
         if not args_list and sys.stdin.isatty():
+            print_rich_help()
+            return 0
+        if False:
             # A human typed `safereach` and would otherwise watch a silent server wait
             # on stdin forever. Agents launch it over a pipe, never a TTY.
-            build_parser().print_help(sys.stderr)
             return 0
 
         from .server import run
