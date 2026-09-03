@@ -1692,14 +1692,86 @@ def cmd_shim_update(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------------------
 
 
+#: The listing argparse generates is ungrouped and alphabetical-ish: it tells a reader
+#: the commands exist, not which one to run first. This is written by hand instead, with
+#: the three commands that get someone working at the top.
+HELP_EPILOG = """\
+quick start
+  safereach enroll --all        set up every server you can already ssh to
+  safereach install             register with Claude Code, Codex, Cursor, ...
+  safereach doctor              check that it all works
+
+setting up servers
+  enroll                        add hosts over your existing SSH access (no sudo)
+  discover                      show what is reachable, changing nothing
+  provision                     create a dedicated unprivileged account on a host
+  rename                        give a host a friendlier name (local, no re-enrol)
+  shim-update                   redeploy the remote validator after a spec change
+
+connecting agents
+  install                       register this server with your AI agents
+  uninstall                     remove that registration
+
+checking and debugging
+  doctor                        verify config, keys, connectivity, shim versions
+  validate                      test a command against the allowlist, offline
+  init                          write a starter hosts.yaml
+
+  safereach <command> --help    details for any command
+
+With no arguments safereach runs as an MCP server over stdio. That is how agents
+launch it; you rarely need to run it that way yourself.
+"""
+
+#: Per-command descriptions, applied after the parsers are built.
+#:
+#: Kept as data rather than threaded through ten `add_parser` calls: the descriptions are
+#: prose that wants editing, and the call sites are already dense with arguments.
+SUBCOMMAND_DESCRIPTIONS = {
+    "init": "Write a starter hosts.yaml you can edit by hand.\n\nMost people do not need this — `enroll` writes the file for you.",
+    "install": "Register safereach with your AI agents.\n\nDetects Claude Code, Claude Desktop, Codex, Cursor, Windsurf, VS Code, Zed\nand Gemini CLI, and merges into each config without disturbing any other MCP\nservers you have. Safe to re-run.",
+    "uninstall": "Remove safereach's registration from your agents.\n\nRemoves only safereach's own entry; other MCP servers are untouched.",
+    "enroll": "Set up hosts over the SSH access you already have. No sudo needed.\n\nGenerates a dedicated keypair, installs the remote validator, and pins the key\nto a forced command so it can invoke nothing else. Your existing\nauthorized_keys entries are left alone.\n\nAdd --hardened to also create an unprivileged account with read-only Docker\naccess (needs sudo on the target, once).",
+    "discover": "Show which servers in ~/.ssh/config you can reach with your existing keys.\n\nRead-only: changes nothing locally or remotely. Useful before `enroll`.",
+    "rename": "Give a host a friendlier name than the one discovery produced.\n\nPurely local — the remote host never knew the name, so nothing needs\nre-enrolling. The stable id is preserved, so audit history stays joined.",
+    "validate": "Check whether a command would be allowed, without connecting to anything.\n\nShows the exact string that would run, including flags safereach injects.\nUseful when extending config/commands.yaml.",
+    "doctor": "Verify config, key permissions, host reachability, and whether each host's\nremote validator matches this version.\n\nThe first thing to run when an agent reports something odd.",
+    "provision": "Create a dedicated unprivileged account on a host, using your admin access.\n\nStronger than plain `enroll`: the account has no sudo and is not in the docker\ngroup, so it is a second barrier behind the command allowlist.",
+    "shim-update": "Rebuild the remote validator and redeploy it.\n\nRun after changing config/commands.yaml. Hosts running an older copy are\nrefused rather than silently allowed to use a stale allowlist.",
+}
+
+
+def _describe_subcommands(sub: argparse._SubParsersAction) -> None:
+    """Give each subcommand its own --help text, and hide the flat list.
+
+    argparse's generated listing is alphabetical-ish with no grouping — it says which
+    commands exist but not which to run first. Clearing `_choices_actions` removes it so
+    the hand-grouped epilog is the only listing, while `safereach <cmd> --help` gains the
+    description it never had (`help=` only ever fed the parent's list).
+    """
+    for name, description in SUBCOMMAND_DESCRIPTIONS.items():
+        parser = sub.choices.get(name)
+        if parser is not None:
+            parser.description = description
+            parser.formatter_class = argparse.RawDescriptionHelpFormatter
+    sub._choices_actions.clear()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="safereach",
-        description="Read-only remote diagnostics over SSH, as an MCP server. "
-        "With no subcommand, runs the MCP server over stdio.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Read-only production diagnostics over SSH, for AI agents.\n\n"
+            "Gives an agent a read-only view of your servers — logs, services, disk,\n"
+            "containers, endpoints — while making destructive commands and secret\n"
+            "disclosure structurally impossible rather than merely discouraged."
+        ),
+        epilog=HELP_EPILOG,
     )
     parser.add_argument("--config", help="path to hosts.yaml")
-    sub = parser.add_subparsers(dest="cmd")
+    parser.add_argument("--version", action="version", version=f"safereach {__version__}")
+    sub = parser.add_subparsers(dest="cmd", metavar="<command>")
 
     p = sub.add_parser("init", help="scaffold hosts.yaml")
     p.add_argument("--path")
@@ -1828,6 +1900,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--admin-user", default=os.environ.get("USER", "root"))
     p.set_defaults(func=cmd_shim_update)
 
+    _describe_subcommands(sub)
     return parser
 
 
@@ -1861,6 +1934,12 @@ def main(argv: list[str] | None = None) -> int:
     # argparse. Getting this backwards meant `--help` started the server and died looking
     # for hosts.yaml.
     if _is_server_invocation(args_list):
+        if not args_list and sys.stdin.isatty():
+            # A human typed `safereach` and would otherwise watch a silent server wait
+            # on stdin forever. Agents launch it over a pipe, never a TTY.
+            build_parser().print_help(sys.stderr)
+            return 0
+
         from .server import run
 
         run()

@@ -9,6 +9,7 @@ tempting to add.
 
 from __future__ import annotations
 
+import argparse
 import json
 import queue
 import subprocess
@@ -287,3 +288,43 @@ def test_help_does_not_start_the_server() -> None:
     assert "usage:" in combined
     assert "discover" in combined
     assert "Traceback" not in combined
+
+
+def test_bare_invocation_on_a_tty_shows_help_not_a_silent_server() -> None:
+    """A human typing `safereach` should not watch a server wait on stdin forever.
+
+    Agents launch it over a pipe, never a TTY, so the two cases are distinguishable —
+    and `test_stdout_is_pure_jsonrpc` above proves the pipe case still starts a server.
+    """
+    proc = subprocess.run(
+        ["script", "-qec", f"{sys.executable} -m safereach", "/dev/null"],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), "PYTHONPATH": str(REPO / "src")},
+        timeout=30,
+        check=False,
+    )
+    combined = proc.stdout + proc.stderr
+    assert "usage: safereach" in combined
+    assert "quick start" in combined, "the grouped listing should be what a human sees"
+
+
+def test_help_groups_commands_by_task() -> None:
+    """The generated list says which commands exist; the grouping says which to run."""
+    from safereach.cli import HELP_EPILOG
+
+    for heading in ("quick start", "setting up servers", "connecting agents"):
+        assert heading in HELP_EPILOG
+    assert HELP_EPILOG.index("quick start") < HELP_EPILOG.index("setting up servers")
+
+
+def test_every_subcommand_explains_itself() -> None:
+    """`help=` only ever fed the parent listing, so per-command help had no description."""
+    from safereach.cli import build_parser
+
+    sub = next(
+        a for a in build_parser()._actions if isinstance(a, argparse.__dict__["_SubParsersAction"])
+    )
+    for name, parser in sub.choices.items():
+        assert parser.description, f"`safereach {name} --help` has no description"
