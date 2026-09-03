@@ -19,8 +19,8 @@ or reach a host it wasn't granted.
 ## Quick start
 
 ```bash
-uvx safereach@0.1.0 enroll --all      # set up every server you can already ssh to
-uvx safereach@0.1.0 install           # register with your agents
+uvx safereach@0.1.1 enroll --all      # set up every server you can already ssh to
+uvx safereach@0.1.1 install           # register with your agents
 ```
 
 > **Pre-release:** until this is on PyPI, install from source and register with
@@ -131,7 +131,7 @@ the socket proxy. A proxy bug lands on an account that cannot do much anyway.
 ### Recommended — `uvx`, pinned
 
 ```bash
-uvx safereach@0.1.0 --help
+uvx safereach@0.1.1 --help
 ```
 
 Nothing installed globally, and it is the one launch form that works identically for every
@@ -147,7 +147,7 @@ recommended.
 ### Alternative — a persistent install
 
 ```bash
-uv tool install safereach==0.1.0
+uv tool install safereach==0.1.1
 ```
 
 ### From source
@@ -392,6 +392,33 @@ proves only that the input was empty.
 ---
 
 ## Release notes
+
+### 0.1.1
+
+**Terminal output**
+- `--help`, `doctor`, `discover` and `install --list` render as tables with a shared
+  colour vocabulary, so a status means the same thing in every command
+- the console is bound to **stderr**, never stdout — stdout carries JSON-RPC in server
+  mode, and one styled byte there corrupts the stream for every agent. Five tests hold
+  that line, including one asserting the bundled shim still imports no `rich`
+- colour is dropped when piped and when `NO_COLOR` is set
+
+**Help**
+- commands are grouped by task with a quick start on top, rather than listed
+  alphabetically — the generated list said which commands existed, not which to run first
+- every subcommand gained a description; `help=` only ever fed the parent's listing, so
+  `safereach enroll --help` had been flags and nothing else
+- `safereach` with no arguments on a terminal now shows help instead of starting a silent
+  server and appearing to hang. Agents launch it over a pipe, so the two cases are
+  distinguishable
+- added `--version`
+
+**Release automation**
+- publishing is triggered by a version change rather than by merging. PyPI versions are
+  immutable, so publishing on every merge would fail on the first merge that did not bump
+- PEP 740 attestations bind each artifact to the commit and workflow that built it
+- the GitHub release is tagged only after a successful upload, so a tag always names
+  something installable
 
 ### 0.1.0 — initial release
 
