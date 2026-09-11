@@ -454,8 +454,12 @@ It enrols the host with `--hardened --allow-exec`, then asserts on the host itse
 (policy `0640 root:diag`, socket `0660`, `sshd -T -C user=diag`, `visudo -c`), replays
 every reproduction string from the security review through the real shim, checks the
 legal diagnostics come back with their secrets scrubbed, and confirms another local
-account can read neither the policy nor the socket. Run it before every release that
-touches `cli.py`, the scripts, or the spec.
+account can read neither the policy nor the socket.
+
+CI runs it on **every push and pull request**, and the `ci-ok` check requires it. The
+publish workflow runs it again on the exact tree being released, before the wheel is
+built, so nothing reaches PyPI that has not been enrolled onto a real host in the same
+run.
 
 ## Release notes
 

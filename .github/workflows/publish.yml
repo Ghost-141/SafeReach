@@ -76,6 +76,7 @@ jobs:
     needs: decide
     if: needs.decide.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -93,6 +94,16 @@ jobs:
         run: uv run ruff check .
       - name: Format
         run: uv run ruff format --check .
+
+      # The release gate that matters: this exact tree, enrolled onto a real host as
+      # root, with the review's probes replayed against the real shim. Nothing reaches
+      # PyPI that has not passed it in the same run.
+      - name: Build the disposable host image
+        run: docker build -t safereach-e2e-host tests/e2e
+      - name: End-to-end suite against a real host
+        env:
+          SAFEREACH_E2E: "1"
+        run: uv run pytest tests/e2e -v
 
       - name: Build sdist and wheel
         run: uv build
