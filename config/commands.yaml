@@ -46,9 +46,15 @@ journalctl:
 systemctl:
   description: Inspect systemd unit state (read-only subcommands only)
   force_flags: ["--no-pager"]
-  subcommands: [status, is-active, is-enabled, is-failed, list-units, list-timers, list-sockets, show, cat]
+  subcommands: [status, is-active, is-enabled, is-failed, list-units, list-timers, list-sockets, show]
   # `show` is only safe when narrowed; the bare form dumps Environment=.
   # `show-environment` is removed entirely — its whole purpose is dumping the environment.
+  # `cat` is removed too: it prints the unit file verbatim, and unit files carry
+  # `Environment=KEY=value` and `ExecStart=… --token …` lines. `show -p FragmentPath`
+  # says where the file is; `journalctl -u` says what it did. Neither prints it.
+  #
+  # `status` stays, but the shim rewrites its CGroup tree to PID and binary name only —
+  # the full argv on those lines is where `mysql -pSECRET` lives.
   required_flags_for:
     show: ["-p"]
   flags:
@@ -72,6 +78,8 @@ systemctl:
          RestartUSec, WatchdogUSec, Following, TriggeredBy, Triggers] } }
   positionals: { max: 5, pattern: '[A-Za-z0-9@._:\-]{1,128}' }
   deny_subcommands:
+    cat: "prints the unit file verbatim, including Environment= and ExecStart= values; use `show -p FragmentPath` and `journalctl -u`"
+    show-environment: "dumps the manager environment"
     start: "changes service state"
     stop: "changes service state"
     restart: "changes service state"
@@ -120,11 +128,13 @@ du:
     "-h": { alias: "--human-readable", value: none }
     "-s": { alias: "--summarize", value: none }
     "-x": { alias: "--one-file-system", value: none }
-    "-d": { alias: "--max-depth", value: { type: int, min: 0, max: 5 } }
+    "-d": { alias: "--max-depth", value: { type: int, min: 0, max: 3 } }
   positionals:
     max: 3
     pattern: '/[A-Za-z0-9._/\-]{1,255}'
-    path_prefixes: ["/var/", "/tmp/", "/opt/", "/srv/", "/home/"]
+    # No /home: directory names under a home directory are not diagnostics, and a deep
+    # `du` over every home is an IO storm on a production box for nothing.
+    path_prefixes: ["/var/", "/tmp/", "/opt/", "/srv/"]
 
 free:
   description: Memory and swap usage
@@ -160,16 +170,27 @@ hostnamectl:
     set-location: "changes host metadata"
 
 ps:
-  description: Process table
+  description: Process table (no command-line arguments — those carry passwords)
+  # LAYER 0 — structural removal. The full-format switches (-f, -F, -l, -a, -x, -u, -w)
+  # print every process's complete argv, which is where `mysql -pSECRET`,
+  # `redis-cli -a hunter2` and `app --token …` live. Bare `ps -e` prints CMD as the
+  # executable name only, and `-o` is pinned to an enumerated column alphabet that has
+  # no `args`, `cmd`, `command` or `cmdline` in it. A column that cannot be named cannot
+  # leak.
   flags:
     "-e": { value: none }
-    "-f": { value: none }
-    "-a": { value: none }
-    "-u": { value: none }
-    "-x": { value: none }
-    "-o": { value: { type: regex, pattern: '[a-z_,=:%\-]{1,120}' } }
+    "-o": { value: { type: regex, pattern: '(?:pid|ppid|pgid|user|uid|group|gid|%cpu|pcpu|%mem|pmem|rss|vsz|sz|stat|state|s|etime|etimes|time|cputime|nlwp|thcount|tty|tname|comm|ucomm|lstart|start|start_time|ni|nice|pri|psr|wchan)(?:,(?:pid|ppid|pgid|user|uid|group|gid|%cpu|pcpu|%mem|pmem|rss|vsz|sz|stat|state|s|etime|etimes|time|cputime|nlwp|thcount|tty|tname|comm|ucomm|lstart|start|start_time|ni|nice|pri|psr|wchan))*' } }
     "--sort": { value: { type: regex, pattern: '[a-z_,+\-]{1,60}' } }
   positionals: { max: 0 }
+  deny_flags:
+    "-f": "full-format output prints every process's complete command line, including passwords passed as arguments; use -o with named columns"
+    "-F": "extra-full format prints complete command lines"
+    "-l": "long format prints complete command lines"
+    "-a": "BSD-style output prints complete command lines"
+    "-x": "BSD-style output prints complete command lines"
+    "-u": "BSD-style user-oriented output prints complete command lines"
+    "-w": "wide output only matters for command lines, which are not shown"
+    "-c": "scheduler output prints complete command lines"
 
 # ---------------------------------- network ------------------------------------------
 
@@ -315,9 +336,13 @@ docker:
         "--filter": { value: { type: regex, pattern: '[a-z]{1,16}=[A-Za-z0-9._*\-]{1,64}' } }
         "--last": { value: { type: int, min: 1, max: 100 } }
         "--size": none
+    # LAYER 0 — `inspect` has no --format. A Go template can reach Config.Env in more
+    # ways than a value regex can enumerate ({{.Config.Env}}, {{json .Config}},
+    # {{json .}}, {{range …}}), and the template output is text, so the structural mask
+    # that walks the JSON never sees it. Without --format the output is always JSON and
+    # always masked. `docker ps --filter name=x` answers the status one-liner instead.
     - path: [inspect]
       flags:
-        "--format": { value: { type: regex, pattern: '[A-Za-z0-9 {}._$|"''\[\]\-]{1,160}' } }
         "--size": none
     - path: [logs]
       force: ["--tail", "500"]
@@ -336,9 +361,6 @@ docker:
     - path: [top]
     - path: [port]
     - path: [diff]
-    - path: [history]
-      flags:
-        "--no-trunc": none
     - path: [images]
       flags:
         "--all": none
@@ -350,8 +372,6 @@ docker:
         "--all": none
         "--filter": { value: { type: regex, pattern: '[a-z]{1,16}=[A-Za-z0-9._*\-]{1,64}' } }
     - path: [container, inspect]
-      flags:
-        "--format": { value: { type: regex, pattern: '[A-Za-z0-9 {}._$|"''\[\]\-]{1,160}' } }
     - path: [container, logs]
       force: ["--tail", "500"]
       flags:
@@ -366,13 +386,8 @@ docker:
         "--no-stream": none
     - path: [image, ls]
     - path: [image, inspect]
-      flags:
-        "--format": { value: { type: regex, pattern: '[A-Za-z0-9 {}._$|"''\[\]\-]{1,160}' } }
-    - path: [image, history]
     - path: [network, ls]
     - path: [network, inspect]
-      flags:
-        "--format": { value: { type: regex, pattern: '[A-Za-z0-9 {}._$|"''\[\]\-]{1,160}' } }
     - path: [volume, ls]
     - path: [volume, inspect]
     - path: [compose, ps]
@@ -395,6 +410,7 @@ docker:
     "--follow": "streams forever and would hang the connection"
     "--host": "would redirect docker at a different daemon"
   deny_subcommands:
+    history: "prints ENV and ARG build layers, which is where build-time secrets end up"
     exec: "arbitrary code execution inside the container"
     run: "arbitrary code execution, and -v can mount the host filesystem"
     create: "creates containers"
@@ -432,20 +448,22 @@ docker:
 
 # ---------------------------------- endpoints ----------------------------------------
 #
-# curl is a file-read and file-write primitive that happens to speak HTTP. Four pins,
+# curl is a file-read and file-write primitive that happens to speak HTTP. Five pins,
 # all independent: scheme (force-injected --proto), method (-X denied, so GET or HEAD),
-# target host (per-host curl_targets allowlist), and no local file access (@-values
-# rejected globally, -o restricted to /dev/null).
+# target host AND port (per-host curl_targets allowlist, `host:port`; a bare host means
+# 80 and 443 only, never "every service on loopback"), no redirects (-L denied, so an
+# open redirector on a permitted target cannot pivot to an unlisted one), and no local
+# file access (@-values rejected globally, -o restricted to /dev/null). The host's own
+# Docker API port is refused before the allowlist is consulted, however it is listed.
 
 curl:
   description: Check whether an HTTP endpoint responds (GET/HEAD only)
   reject_at_values: true
   force_args:
-    ["--silent", "--show-error", "--proto", "=http,https", "--max-time", "15", "--max-redirs", "3"]
+    ["--silent", "--show-error", "--proto", "=http,https", "--max-time", "15"]
   flags:
     "-I": { alias: "--head", value: none }
     "-i": { alias: "--include", value: none }
-    "-L": { alias: "--location", value: none }
     "-s": { alias: "--silent", value: none }
     "-S": { alias: "--show-error", value: none }
     "-k": { alias: "--insecure", value: none }
@@ -454,7 +472,6 @@ curl:
     "-H": { alias: "--header", value: { type: regex, pattern: '[A-Za-z0-9\-]{1,40}: [^@\r\n]{1,200}' } }
     "--max-time": { value: { type: int, min: 1, max: 60 } }
     "--connect-timeout": { value: { type: int, min: 1, max: 30 } }
-    "--max-redirs": { value: { type: int, min: 0, max: 10 } }
     "--proto": { value: { type: enum, choices: ["=http,https"] } }
     "--retry": { value: { type: int, min: 0, max: 3 } }
   positionals:
@@ -462,6 +479,10 @@ curl:
     pattern: 'https?://[A-Za-z0-9._\-]{1,253}(:[0-9]{1,5})?(/[A-Za-z0-9._~%/\-]*)?(\?[A-Za-z0-9._~%&=+\-]*)?'
     host_allowlist_from: curl_targets
   deny_flags:
+    "-L": "--location follows redirects, and a redirect from a permitted target can point anywhere; read the Location header with -i instead"
+    "--location": "follows redirects, and a redirect from a permitted target can point anywhere; read the Location header with -i instead"
+    "--location-trusted": "follows redirects and re-sends credentials to wherever they lead"
+    "--max-redirs": "redirects are never followed"
     "--unix-socket": "speaks the Docker API directly — remote code execution"
     "--abstract-unix-socket": "speaks the Docker API directly — remote code execution"
     "-K": "--config loads options from a file, bypassing this allowlist entirely"
@@ -521,6 +542,21 @@ kubectl:
       flags:
         "--namespace": { value: { type: regex, pattern: '[a-z0-9][a-z0-9\-]{0,62}' } }
         "--selector": { value: { type: regex, pattern: '[A-Za-z0-9._/=,\-]{1,128}' } }
+      # `describe configmap` prints every key's full value; `get cm` prints names and
+      # ages, which is why it is not denied at the binary level. The spec linter checks
+      # that this deny is a superset of the binary-level one, so the two cannot drift.
+      # Abbreviations (`cm`, `sa`) are canonicalised by the validator before this check.
+      positionals:
+        max: 3
+        pattern: '[a-z0-9][A-Za-z0-9._/\-]{0,127}'
+        deny:
+          secret: "returns base64-encoded credentials for the whole namespace"
+          secrets: "returns base64-encoded credentials for the whole namespace"
+          csidrivers: "exposes storage credentials"
+          serviceaccounts: "exposes token references"
+          serviceaccount: "exposes token references"
+          configmaps: "describe prints every ConfigMap value in full; use `get configmaps` for names"
+          configmap: "describe prints every ConfigMap value in full; use `get configmaps` for names"
     - path: [logs]
       force: ["--tail", "500"]
       flags:

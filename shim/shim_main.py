@@ -33,6 +33,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -47,8 +48,17 @@ from safereach.redact import (  # noqa: E402
     mask_env_keys,
     redact_docker_inspect,
     redact_text,
+    scrub_cgroup_cmdlines,
+    scrub_describe_environment,
 )
-from safereach.validator import Rejected, render, validate, validate_argv  # noqa: E402
+from safereach.validator import (  # noqa: E402
+    BUILTIN_DENY_PATHS,
+    Rejected,
+    docker_host_deny_targets,
+    render,
+    validate,
+    validate_argv,
+)
 
 # --- END IMPORT SHIM ------------------------------------------------------------------
 
@@ -56,51 +66,13 @@ from safereach.validator import Rejected, render, validate, validate_argv  # noq
 EMBEDDED_SPEC: dict[str, Any] = {}
 SHIM_VERSION = "dev"
 
+#: The protected-path list is `validator.BUILTIN_DENY_PATHS`, inlined into this file.
+#: Compiled in, so a hand-edited host policy can ADD patterns but never remove them.
+#: A denylist a compromised or careless edit can empty is not a control.
+
 #: Searched in order, first hit wins. The user-local path is what `enroll` writes: it
 #: needs no root, which is the whole reason enrolment can be a single command run over
 #: the SSH access you already have.
-#: Compiled into the shim, so a hand-edited host policy can ADD patterns but never
-#: remove these. A denylist a compromised or careless edit can empty is not a control.
-BUILTIN_DENY_PATHS = (
-    "*.env",
-    "*.env.*",
-    ".env*",
-    "*.envrc",
-    "*/secrets/*",
-    "*/secret/*",
-    "*.pem",
-    "*.key",
-    "*.p12",
-    "*.pfx",
-    "*.jks",
-    "*.keystore",
-    "*.gpg",
-    "*.asc",
-    "id_rsa*",
-    "id_dsa*",
-    "id_ed25519*",
-    "id_ecdsa*",
-    "*_rsa",
-    "*_ed25519",
-    "*/.ssh/*",
-    "*/.gnupg/*",
-    "*credentials*",
-    "*.kubeconfig",
-    "*/.kube/config",
-    "*/.aws/*",
-    "*/.azure/*",
-    "*/.config/gcloud/*",
-    "*/.docker/config.json",
-    "*/.netrc",
-    ".netrc",
-    "*/.git-credentials",
-    "*/.pgpass",
-    "*.htpasswd",
-    "/etc/shadow",
-    "/etc/gshadow",
-    "/etc/sudoers*",
-)
-
 CONFIG_PATHS = (
     Path("/etc/safereach/config.json"),
     Path.home() / ".config" / "safereach-shim" / "config.json",
@@ -129,6 +101,19 @@ def load_config() -> dict[str, Any]:
             _die(EXIT_INTERNAL, f"safereach-shim: {path}: config root must be an object")
         return cfg
     return {}
+
+
+def _host_ctx(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Everything the validator needs to know about THIS host, from its own policy.
+
+    The Docker API port is derived from `docker_host` rather than listed: an operator
+    who forgets to deny it, or who lists it on purpose, still cannot reach it with curl.
+    """
+    return {
+        "curl_targets": cfg.get("curl_targets") or [],
+        "curl_deny_targets": docker_host_deny_targets(cfg.get("docker_host")),
+        "deny_paths": [*BUILTIN_DENY_PATHS, *(cfg.get("deny_paths") or [])],
+    }
 
 
 def audit(record: dict[str, Any]) -> None:
@@ -166,6 +151,24 @@ def _is_env_bearing(argv: list[str]) -> bool:
     )
 
 
+def _resource_wrapper(path: str, timeout: int) -> list[str]:
+    """Run every command at the lowest CPU and IO priority, with a hard CPU-time cap.
+
+    This tool reaches production. A `du` over a big tree or a `grep -r` across all of
+    /var/log must lose every scheduling contest with the workload it is diagnosing, and a
+    runaway must die on its own rather than rely on the SSH channel closing. Each wrapper
+    is used only where present, so a minimal host still runs the command, just unboxed.
+    """
+    wrapper: list[str] = []
+    if shutil.which("nice", path=path):
+        wrapper += ["nice", "-n", "19"]
+    if shutil.which("ionice", path=path):
+        wrapper += ["ionice", "-c", "3"]
+    if shutil.which("prlimit", path=path):
+        wrapper += ["prlimit", f"--cpu={max(1, timeout)}", "--"]
+    return wrapper
+
+
 def run_argv(argv: list[str], cfg: dict[str, Any]) -> int:
     """Execute a validated argv with no shell involved at all.
 
@@ -186,10 +189,16 @@ def run_argv(argv: list[str], cfg: dict[str, Any]) -> int:
     if cfg.get("docker_host"):
         env["DOCKER_HOST"] = str(cfg["docker_host"])
 
+    # Resolve the binary before wrapping it: otherwise a missing tool surfaces as
+    # `prlimit: failed to execute …` (exit 127) instead of the message below.
+    if shutil.which(argv[0], path=env["PATH"]) is None:
+        _die(EXIT_INTERNAL, f"safereach-shim: {argv[0]!r} is not installed on this host")
+    wrapper = _resource_wrapper(env["PATH"], timeout)
+
     started = time.monotonic()
     try:
         proc = subprocess.run(  # noqa: S603 - argv is validated and never shell-parsed
-            argv,
+            [*wrapper, *argv],
             capture_output=True,
             timeout=timeout,
             env=env,
@@ -211,6 +220,7 @@ def run_argv(argv: list[str], cfg: dict[str, Any]) -> int:
         {
             "decision": "allowed",
             "argv": argv,
+            "wrapper": wrapper,
             "exit_code": proc.returncode,
             "duration_ms": duration_ms,
             "bytes_out": len(proc.stdout),
@@ -227,6 +237,13 @@ def run_argv(argv: list[str], cfg: dict[str, Any]) -> int:
     text_out = out.decode("utf-8", errors="replace")
     if _is_env_bearing(argv):
         text_out = redact_docker_inspect(text_out, cfg.get("env_allowlist") or [])
+    # Structural scrubs, driven by the output's shape rather than by keywords: the
+    # argv on every CGroup line of `systemctl status`, and the values under every
+    # `Environment:` heading of `kubectl describe`.
+    if argv[:2] == ["systemctl", "status"]:
+        text_out = scrub_cgroup_cmdlines(text_out)
+    if argv[:2] == ["kubectl", "describe"]:
+        text_out = scrub_describe_environment(text_out)
     text_out = mask_env_keys(text_out, cfg.get("secret_env_keys") or [])
     # Layer 3: catches a value with no variable name attached — a token in a stack
     # trace, a password quoted in an application log.
@@ -290,10 +307,7 @@ def _handle_run(payload: str, cfg: dict[str, Any]) -> int:
             argv,
             EMBEDDED_SPEC,
             allow=cfg.get("allow"),
-            ctx={
-                "curl_targets": cfg.get("curl_targets") or [],
-                "deny_paths": [*BUILTIN_DENY_PATHS, *(cfg.get("deny_paths") or [])],
-            },
+            ctx=_host_ctx(cfg),
         )
     except Rejected as rej:
         audit({"decision": "rejected", "requested": argv, "reason": rej.reason})
@@ -317,21 +331,36 @@ def _handle_run(payload: str, cfg: dict[str, Any]) -> int:
 #: exactly like anything else. `docker exec app sh -c 'rm -rf /'` fails because `sh` is
 #: not an allowlisted binary — not because of a special case for `sh`.
 EXEC_INNER_SPEC = {
+    # Content-reading commands take their permitted prefixes from the host's own policy
+    # (`exec_path_prefixes`, written by `enroll --exec-path`). No prefixes configured
+    # means these four refuse everything — default-deny, exactly like curl_targets.
     "cat": {
         "description": "Read an application log inside the container",
         "flags": {"-n": {"value": None}},
-        "positionals": {"max": 2, "pattern": r"/[A-Za-z0-9._/\-]{1,200}"},
+        "positionals": {
+            "max": 2,
+            "pattern": r"/[A-Za-z0-9._/\-]{1,200}",
+            "path_prefixes_from": "exec_path_prefixes",
+        },
     },
     "tail": {
         "description": "Last lines of a log inside the container",
         "flags": {"-n": {"alias": "--lines", "value": {"type": "int", "min": 1, "max": 2000}}},
-        "positionals": {"max": 2, "pattern": r"/[A-Za-z0-9._/\-]{1,200}"},
+        "positionals": {
+            "max": 2,
+            "pattern": r"/[A-Za-z0-9._/\-]{1,200}",
+            "path_prefixes_from": "exec_path_prefixes",
+        },
         "deny_flags": {"-f": "streams forever", "--follow": "streams forever"},
     },
     "head": {
         "description": "First lines of a log inside the container",
         "flags": {"-n": {"alias": "--lines", "value": {"type": "int", "min": 1, "max": 2000}}},
-        "positionals": {"max": 2, "pattern": r"/[A-Za-z0-9._/\-]{1,200}"},
+        "positionals": {
+            "max": 2,
+            "pattern": r"/[A-Za-z0-9._/\-]{1,200}",
+            "path_prefixes_from": "exec_path_prefixes",
+        },
     },
     "ls": {
         "description": "List a directory inside the container",
@@ -380,7 +409,10 @@ EXEC_INNER_SPEC = {
         "positionals": {
             "max": 3,
             "specs": [{"pattern": r"[^`$\\]{1,200}"}],
-            "rest": {"pattern": r"/[A-Za-z0-9._/\-]{1,200}"},
+            "rest": {
+                "pattern": r"/[A-Za-z0-9._/\-]{1,200}",
+                "path_prefixes_from": "exec_path_prefixes",
+            },
         },
         "deny_flags": {"-f": "reads the pattern list from a file", "-r": "walks the filesystem"},
     },
@@ -437,7 +469,10 @@ def handle_exec(payload: str, cfg: dict[str, Any]) -> int:
             argv,
             EXEC_INNER_SPEC,
             allow=cfg.get("exec_allow"),
-            ctx={"deny_paths": [*BUILTIN_DENY_PATHS, *(cfg.get("deny_paths") or [])]},
+            ctx={
+                "deny_paths": [*BUILTIN_DENY_PATHS, *(cfg.get("deny_paths") or [])],
+                "exec_path_prefixes": list(cfg.get("exec_path_prefixes") or []),
+            },
         )
     except Rejected as rej:
         audit(
@@ -467,12 +502,7 @@ def _handle_check(command: str, cfg: dict[str, Any]) -> int:
     validator = validate_argv if stripped.startswith("[") else validate
     subject: Any = _decode_argv(stripped) if stripped.startswith("[") else command
     try:
-        result = validator(
-            subject,
-            EMBEDDED_SPEC,
-            allow=cfg.get("allow"),
-            ctx={"curl_targets": cfg.get("curl_targets") or []},
-        )
+        result = validator(subject, EMBEDDED_SPEC, allow=cfg.get("allow"), ctx=_host_ctx(cfg))
     except Rejected as rej:
         print(rej.render(), file=sys.stderr)
         return EXIT_REJECTED
@@ -532,12 +562,7 @@ def main(argv: list[str] | None = None) -> int:
         _die(EXIT_REJECTED, f"Rejected: unknown control command {verb!r}")
 
     try:
-        result = validate(
-            requested,
-            EMBEDDED_SPEC,
-            allow=cfg.get("allow"),
-            ctx={"curl_targets": cfg.get("curl_targets") or []},
-        )
+        result = validate(requested, EMBEDDED_SPEC, allow=cfg.get("allow"), ctx=_host_ctx(cfg))
     except Rejected as rej:
         audit({"decision": "rejected", "requested": requested, "reason": rej.reason})
         _die(EXIT_REJECTED, rej.render())

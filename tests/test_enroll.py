@@ -46,8 +46,11 @@ def fake_home(tmp_path: Path, shim_path: Path) -> Path:
     (home / ".ssh").mkdir(parents=True)
     (home / ".ssh" / "authorized_keys").write_text(EXISTING_KEYS, encoding="utf-8")
 
-    shutil.copy(shim_path, Path("/tmp/.safereach-shim.upload"))
-    Path("/tmp/.safereach-shim.conf.upload").write_text(
+    # What `_remote_tmpdir` + `_upload` leave on the host before the script runs.
+    upload = tmp_path / "upload"
+    upload.mkdir()
+    shutil.copy(shim_path, upload / "safereach-shim")
+    (upload / "config.json").write_text(
         json.dumps({"curl_targets": ["localhost"]}), encoding="utf-8"
     )
     return home
@@ -57,6 +60,7 @@ def run_enroll_script(home: Path) -> subprocess.CompletedProcess:
     script = ENROLL_SCRIPT.format(
         strip=_strip_markers_sh('"$HOME/.ssh/.ak.new"'),
         authkey=AUTHKEY_LINE.format(home=home),
+        upload_dir=str(home.parent / "upload"),
     )
     return subprocess.run(
         ["bash", "-s"],

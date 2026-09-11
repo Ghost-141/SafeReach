@@ -20,6 +20,7 @@ Two implementation choices worth knowing about:
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -27,6 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 __all__ = [
+    "ssh_command",
+    "scp_command",
     "DiscoveredHost",
     "candidate_aliases",
     "resolve_alias",
@@ -35,6 +38,23 @@ __all__ = [
 ]
 
 SSH_CONFIG = Path.home() / ".ssh" / "config"
+
+
+def ssh_command(*extra: str) -> list[str]:
+    """``ssh`` as safereach invokes it.
+
+    OpenSSH reads the user config from the passwd home directory, never from ``$HOME``.
+    ``SAFEREACH_SSH_CONFIG`` names an ssh_config to use instead — for a config kept
+    outside ``~/.ssh``, and for the end-to-end rig, which must not touch the real one.
+    """
+    cfg = os.environ.get("SAFEREACH_SSH_CONFIG")
+    return ["ssh", *(["-F", cfg] if cfg else []), *extra]
+
+
+def scp_command(*extra: str) -> list[str]:
+    cfg = os.environ.get("SAFEREACH_SSH_CONFIG")
+    return ["scp", *(["-F", cfg] if cfg else []), *extra]
+
 
 _HOST_LINE = re.compile(r"^\s*Host\s+(.+?)\s*$", re.IGNORECASE)
 _INCLUDE_LINE = re.compile(r"^\s*Include\s+(.+?)\s*$", re.IGNORECASE)
@@ -119,7 +139,7 @@ def resolve_alias(alias: str) -> DiscoveredHost:
 
     try:
         proc = subprocess.run(
-            ["ssh", "-G", alias], capture_output=True, text=True, timeout=10, check=False
+            ssh_command("-G", alias), capture_output=True, text=True, timeout=10, check=False
         )
     except subprocess.TimeoutExpired:
         host.status = "error"
@@ -156,7 +176,7 @@ def probe_alias(alias: str, timeout: int = 8) -> tuple[str, str]:
     accept a new key is reported as such rather than silently trusted.
     """
     cmd = [
-        "ssh",
+        *ssh_command(),
         "-o",
         "BatchMode=yes",
         "-o",

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from safereach.redact import MASK, redact_docker_inspect, redact_text
 
 
@@ -123,3 +125,133 @@ def test_env_masking_keeps_output_diagnosable() -> None:
     assert "POSTGRES_PASSWORD" in out, "the variable name must stay visible"
     assert "TZ=UTC" in out, "allowlisted names come through in the clear"
     assert "postgres:16" in out, "non-env fields must be untouched"
+
+
+# --------------------------------------------------------------------------------------
+# Patterns added after the 0.1.x review: names by convention, argument-style secrets,
+# vendor formats
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sample", "secret"),
+    [
+        ("STRIPE_KEY=sk_test_e2eFAKE0000000000000000", "e2eFAKE0000000000000000"),
+        ("PRIVATE_KEY=abcdefgh", "abcdefgh"),
+        ("ENCRYPTION_KEY=zz", "zz"),
+        ("SIGNING_KEY: k1", "k1"),
+        ("DB_PASS=hunter2", "hunter2"),
+        ("APP_SALT=saltysalt", "saltysalt"),
+        ("SENTRY_DSN=https://abc@o1.ingest.sentry.io/1", "abc@o1"),
+        ("app --token=abc123 --port 8080", "abc123"),
+        ("app --password hunter2", "hunter2"),
+        ("app --api-key=k --verbose", "=k "),
+        ("mysql -uroot -pSuperSecret123 -h db", "SuperSecret123"),
+        ("mysqldump -u app -ps3cret app", "s3cret"),
+        ("redis-cli -a hunter2 ping", "hunter2"),
+        ("Authorization: Bearer abc.def.ghi", "abc.def.ghi"),
+        ("header Bearer zyxwvutsrq123", "zyxwvutsrq123"),
+        ("key AIzaSyD-1234567890123456789012345678901 here", "1234567890123456789012345678901"),
+        ("sk-ant-api03-abcdefghijklmnop", "abcdefghijklmnop"),
+        ("sk-proj-abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnopqrstuvwxyz"),
+        ("glpat-abcdefghijklmnopqrstuv", "abcdefghijklmnopqrstuv"),
+        ("github_pat_abcdefghijklmnopqrstuvwxyz0123", "abcdefghijklmnopqrstuvwxyz0123"),
+        ("ghs_abcdefghijklmnopqrstuvwxyz01", "abcdefghijklmnopqrstuvwxyz01"),
+        ("hvs.CAESIabcdefghijklmnopqrstuvwxyz", "CAESIabcdefghijklmnopqrstuvwxyz"),
+        ("SG.abcdefghijklmnopqrst.uvwxyzabcdefghijklmnop", "uvwxyzabcdefghijklmnop"),
+        ("dckr_pat_abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnopqrstuvwxyz"),
+        ("ASIAIOSFODNN7EXAMPLE", "IOSFODNN7EXAMPLE"),
+        ("xapp-1-A0123456789-abcdefghij", "A0123456789-abcdefghij"),
+    ],
+    ids=lambda v: v[:28],
+)
+def test_review_patterns_mask_the_value(sample: str, secret: str) -> None:
+    out = redact_text(sample)
+    assert secret not in out, out
+    assert MASK in out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "tail -n 5 /var/log/syslog",
+        "app --port 8080 --workers 4",
+        "container 3f2a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a",
+        "commit 9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e",
+        "LOG_LEVEL=info NODE_ENV=production PORT=8080",
+        "Sep 11 10:00:01 host sshd[1]: Accepted publickey for diag",
+        "mysql -h db -u app app",
+    ],
+    ids=lambda t: t[:24],
+)
+def test_review_patterns_leave_diagnostics_alone(text: str) -> None:
+    assert redact_text(text) == text
+
+
+# --------------------------------------------------------------------------------------
+# Structural scrubs
+# --------------------------------------------------------------------------------------
+
+STATUS = """● app.service - The App
+     Loaded: loaded (/etc/systemd/system/app.service; enabled)
+     Active: active (running) since Thu 2026-09-10 08:00:00 UTC; 1 day ago
+   Main PID: 1234 (app)
+      Tasks: 3
+     CGroup: /system.slice/app.service
+             ├─1234 /usr/bin/app --password hunter2 --port 8080
+             ├─1235 mysql -uroot -pSuperSecret123 -h db
+             └─1236 /usr/bin/worker
+
+Sep 11 10:00:00 host app[1234]: listening on :8080
+"""
+
+
+def test_cgroup_lines_keep_pid_and_binary_only() -> None:
+    from safereach.redact import scrub_cgroup_cmdlines
+
+    out = scrub_cgroup_cmdlines(STATUS)
+    assert "hunter2" not in out and "SuperSecret123" not in out and "--port" not in out
+    assert "├─1234 /usr/bin/app …" in out
+    assert "├─1235 mysql …" in out
+    assert "└─1236 /usr/bin/worker" in out
+    # everything that is not a process line is untouched
+    assert "Active: active (running)" in out
+    assert "listening on :8080" in out
+
+
+DESCRIBE = """Name:         api-0
+Containers:
+  app:
+    Image:      app:1.2
+    Environment:
+      DB_HOST:      db.internal
+      STRIPE_KEY:   sk_live_abc
+      TOKEN:        <set to the key 'tok' in secret 'creds'>  Optional: false
+    Environment Variables from:
+      app-config  ConfigMap  Optional: false
+    Mounts:
+      /var/run from x
+Events:
+  Type    Reason   Age  Message
+  Normal  Pulled   1m   Successfully pulled image
+"""
+
+
+def test_describe_environment_values_masked_by_indentation() -> None:
+    from safereach.redact import scrub_describe_environment
+
+    out = scrub_describe_environment(DESCRIBE)
+    assert "db.internal" not in out and "sk_live_abc" not in out
+    assert "DB_HOST:      ***REDACTED***" in out
+    # a reference to a Secret key names the key, not the value; it stays
+    assert "<set to the key 'tok' in secret 'creds'>" in out
+    # the ConfigMap reference line and everything outside the block are untouched
+    assert "app-config  ConfigMap  Optional: false" in out
+    assert "Successfully pulled image" in out
+    assert "/var/run from x" in out
+
+
+def test_inspect_argv_lists_are_masked_in_place() -> None:
+    data = [{"Config": {"Cmd": ["app", "--password", "x", "--port", "8080"], "Env": []}}]
+    out = json.loads(redact_docker_inspect(json.dumps(data), []))
+    assert out[0]["Config"]["Cmd"] == ["app", "--password", MASK, "--port", "8080"]

@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import ast
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
-from conftest import ACCEPTS, ATTACKS, CURL_TARGETS
+from conftest import ACCEPTS, ATTACKS, CURL_TARGETS, DOCKER_HOST
 
 from safereach.validator import Rejected, render, validate
 from safereach.versioning import fingerprint
@@ -53,7 +54,9 @@ sys.exit(mod.main([]))
 def shim_conf(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Host policy matching the fixtures the in-process validator is given."""
     conf = tmp_path_factory.mktemp("shimconf") / "config.json"
-    conf.write_text(json.dumps({"curl_targets": CURL_TARGETS}), encoding="utf-8")
+    conf.write_text(
+        json.dumps({"curl_targets": CURL_TARGETS, "docker_host": DOCKER_HOST}), encoding="utf-8"
+    )
     return conf
 
 
@@ -275,3 +278,119 @@ def test_fingerprint_covers_redaction_changes(tmp_path: Path, spec: dict) -> Non
     baseline = fingerprint(spec, validator + redact)
     changed = fingerprint(spec, validator + redact + "\n# a redaction tweak\n")
     assert baseline != changed
+
+
+# --------------------------------------------------------------------------------------
+# Host-policy-driven controls: the shim reads these from its OWN file, never the wire
+# --------------------------------------------------------------------------------------
+
+
+def _write_conf(path: Path, **policy: object) -> Path:
+    conf = path / "config.json"
+    conf.write_text(json.dumps(policy), encoding="utf-8")
+    return conf
+
+
+def test_docker_api_port_is_refused_even_when_listed(shim_path: Path, tmp_path: Path) -> None:
+    """An operator listing the proxy port in curl_targets does not make it reachable.
+
+    The deny is derived from docker_host, and it wins over the allowlist. Raw API JSON
+    has Config.Env intact; `docker inspect` output does not. The two must not be
+    interchangeable.
+    """
+    conf = _write_conf(
+        tmp_path, curl_targets=["127.0.0.1:2375", "localhost"], docker_host="tcp://127.0.0.1:2375"
+    )
+    for url in (
+        "http://127.0.0.1:2375/containers/json",
+        "http://localhost:2375/containers/app/archive?path=%2Fapp",
+    ):
+        code, _, err = run_shim(shim_path, conf, "@run " + json.dumps(["curl", url]))
+        assert code == 92, (url, err)
+        assert "Docker API" in err
+
+
+def test_bare_curl_target_means_web_ports_only(shim_path: Path, tmp_path: Path) -> None:
+    conf = _write_conf(tmp_path, curl_targets=["localhost"])
+    code, _, err = run_shim(
+        shim_path, conf, "@run " + json.dumps(["curl", "http://localhost:9200/_all/_search"])
+    )
+    assert code == 92
+    assert "80 and 443" in err
+
+
+def test_exec_refuses_content_reads_without_configured_prefixes(
+    shim_path: Path, tmp_path: Path
+) -> None:
+    """`--allow-exec` with no `exec_path_prefixes` is default-deny, like curl_targets."""
+    conf = _write_conf(tmp_path, allow_exec=True, exec_containers=["app"])
+    payload = json.dumps({"container": "app", "argv": ["cat", "/app/storage/logs/laravel.log"]})
+    code, _, err = run_shim(shim_path, conf, "@exec " + payload)
+    assert code == 92
+    assert "no permitted paths" in err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["cat", "/proc/1/environ"],
+        ["cat", "/proc/self/environ"],
+        ["grep", "-i", "pass", "/proc/1/environ"],
+        ["cat", "/app/config/database.yml"],
+        ["cat", "/app/.env"],
+        ["cat", "/root/.bash_history"],
+        ["tail", "-n", "5", "/etc/app/secrets.yaml"],
+        ["cat", "/app/storage/logs/../../.env"],
+        ["head", "/var/www/config.php"],
+    ],
+    ids=lambda a: " ".join(a),
+)
+def test_exec_content_reads_stay_inside_the_prefixes(
+    shim_path: Path, tmp_path: Path, argv: list[str]
+) -> None:
+    conf = _write_conf(
+        tmp_path,
+        allow_exec=True,
+        exec_containers=["app"],
+        exec_path_prefixes=["/app/storage/logs/", "/var/log/"],
+    )
+    payload = json.dumps({"container": "app", "argv": argv})
+    code, _, err = run_shim(shim_path, conf, "@exec " + payload)
+    assert code == 92, err
+    assert err.startswith("Rejected:")
+
+
+def test_exec_permits_a_log_inside_the_prefix(shim_path: Path, tmp_path: Path) -> None:
+    """The inner argv passes validation and the shim reaches the exec step.
+
+    Whether `docker exec` then succeeds depends on the machine (no docker: 93; docker
+    but no such container: docker's own exit code). What must NOT happen is a 92 — that
+    would mean the validator refused a read inside the permitted prefix.
+    """
+    conf = _write_conf(
+        tmp_path,
+        allow_exec=True,
+        exec_containers=["app"],
+        exec_path_prefixes=["/app/storage/logs/"],
+    )
+    payload = json.dumps(
+        {"container": "app", "argv": ["tail", "-n", "50", "/app/storage/logs/laravel.log"]}
+    )
+    code, _, err = run_shim(shim_path, conf, "@exec " + payload)
+    assert code != 92, err
+    log = conf.parent / "audit.jsonl"
+    records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert any(r.get("decision") == "exec" and r.get("container") == "app" for r in records)
+
+
+def test_commands_run_under_the_resource_wrapper(shim_path: Path, shim_conf: Path) -> None:
+    """Every command is niced and CPU-capped where the wrappers exist."""
+    code, out, err = run_shim(shim_path, shim_conf, "uptime")
+    assert code == 0, err
+    log = shim_conf.parent / "audit.jsonl"
+    records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    last = [r for r in records if r.get("decision") == "allowed"][-1]
+    assert last["argv"] == ["uptime"]
+    assert isinstance(last["wrapper"], list)
+    if shutil.which("nice"):
+        assert last["wrapper"][:3] == ["nice", "-n", "19"]

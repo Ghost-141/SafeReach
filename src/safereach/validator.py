@@ -32,8 +32,11 @@ from typing import Any
 from urllib.parse import urlsplit
 
 __all__ = [
+    "BUILTIN_DENY_PATHS",
     "MUTATING_VERBS",
+    "RESOURCE_ALIASES",
     "Rejected",
+    "docker_host_deny_targets",
     "ValidationResult",
     "validate",
     "validate_argv",
@@ -157,6 +160,104 @@ MUTATING_VERBS = frozenset(
         "write",
     }
 )
+
+
+#: Paths the agent may never name, in any argument, on any host, in any container.
+#:
+#: Lives here — the one module inlined into every shim — rather than in the shim or the
+#: CLI, so there is exactly one list. A host policy file can ADD patterns, never remove
+#: these: a denylist a careless edit can empty is not a control. Matched against the
+#: whole token and against its basename, so ``*.env`` catches ``/opt/app/.env``.
+BUILTIN_DENY_PATHS: tuple[str, ...] = (
+    "*.env",
+    "*.env.*",
+    ".env*",
+    "*.envrc",
+    "*/secrets/*",
+    "*/secret/*",
+    "*secrets.yml",
+    "*secrets.yaml",
+    "*secrets.json",
+    "*database.yml",
+    "*database.yaml",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.jks",
+    "*.keystore",
+    "*.gpg",
+    "*.asc",
+    "*.kdbx",
+    "*.ovpn",
+    "*.ppk",
+    "id_rsa*",
+    "id_dsa*",
+    "id_ed25519*",
+    "id_ecdsa*",
+    "*_rsa",
+    "*_ed25519",
+    "*/.ssh/*",
+    "*/.gnupg/*",
+    "*credentials*",
+    "*.kubeconfig",
+    "*/.kube/config",
+    "*/.aws/*",
+    "*/.azure/*",
+    "*/.config/gcloud/*",
+    "*/.docker/config.json",
+    "*/.netrc",
+    ".netrc",
+    "*/.git-credentials",
+    "*/.pgpass",
+    "*.htpasswd",
+    "*_history",
+    "/etc/shadow",
+    "/etc/gshadow",
+    "/etc/sudoers*",
+    # The process and kernel views carry every environment variable of every process
+    # (`/proc/<pid>/environ`) and the kernel's own keys. Nothing diagnostic lives there
+    # that `ps`, `ss` and `df` do not already report in a shape that can be masked.
+    # `/dev` is deliberately absent: `curl -o /dev/null` is the one legitimate write.
+    "/proc/*",
+    "/sys/*",
+    # This tool's own policy and binary. The diag account cannot write them; it must not
+    # be able to read them either, or a digest key in the policy file is one `cat` away.
+    "/etc/safereach/*",
+    "/usr/local/bin/safereach-shim",
+)
+
+#: kubectl resource abbreviations, expanded before a positional deny is checked.
+#: `kubectl get sa` and `kubectl get serviceaccounts` are the same request; denying one
+#: spelling and not the other is not a denial.
+RESOURCE_ALIASES: dict[str, str] = {
+    "cm": "configmaps",
+    "configmap": "configmaps",
+    "csr": "certificatesigningrequests",
+    "deploy": "deployments",
+    "deployment": "deployments",
+    "ds": "daemonsets",
+    "ep": "endpoints",
+    "ev": "events",
+    "ing": "ingresses",
+    "ingress": "ingresses",
+    "no": "nodes",
+    "node": "nodes",
+    "ns": "namespaces",
+    "namespace": "namespaces",
+    "po": "pods",
+    "pod": "pods",
+    "pv": "persistentvolumes",
+    "pvc": "persistentvolumeclaims",
+    "rs": "replicasets",
+    "sa": "serviceaccounts",
+    "serviceaccount": "serviceaccounts",
+    "sc": "storageclasses",
+    "secret": "secrets",
+    "sts": "statefulsets",
+    "svc": "services",
+    "service": "services",
+}
 
 
 # --------------------------------------------------------------------------------------
@@ -323,8 +424,10 @@ def _denied_positional(value: str, deny: dict[str, Any]) -> str | None:
     open.
     """
     head = value.lower().split("/")[0].split(".")[0]
+    head = RESOURCE_ALIASES.get(head, head)
     for name, reason in deny.items():
-        if head == str(name).lower():
+        denied = str(name).lower()
+        if head == RESOURCE_ALIASES.get(denied, denied):
             return str(reason)
     return None
 
@@ -356,6 +459,17 @@ def _check_positional(value: str, pspec: dict[str, Any], ctx: dict[str, Any]) ->
         raise Rejected(f"argument {value!r} is not permitted here")
 
     prefixes = pspec.get("path_prefixes")
+    prefixes_key = pspec.get("path_prefixes_from")
+    if prefixes_key:
+        # Prefixes supplied by the host's own policy rather than by the spec — the
+        # container-exec case, where every host's log directory differs. Default-deny:
+        # a host that has not said where the agent may read has nowhere it may read.
+        prefixes = list(ctx.get(prefixes_key) or [])
+        if not prefixes:
+            raise Rejected(
+                "this host has no permitted paths configured for this command",
+                f"the operator sets '{prefixes_key}' in the host policy (enroll --exec-path)",
+            )
     if prefixes:
         # Reject traversal before the prefix check, so ``/var/log/../../etc/shadow``
         # cannot satisfy the prefix and then climb out of it.
@@ -372,18 +486,70 @@ def _check_positional(value: str, pspec: dict[str, Any], ctx: dict[str, Any]) ->
 
     allow_key = pspec.get("host_allowlist_from")
     if allow_key:
-        _check_url_host(value, ctx.get(allow_key) or [])
+        _check_url_host(value, ctx.get(allow_key) or [], ctx.get("curl_deny_targets") or [])
 
 
-def _check_url_host(url: str, allowed: list[str]) -> None:
-    """Pin a URL's target host to this host's allowlist.
+#: Ports a bare hostname entry in ``curl_targets`` covers. ``localhost`` used to mean
+#: *every* port on the box, which put the Docker API, Elasticsearch, Consul and whatever
+#: else listens on loopback one GET away. A bare name now means the web ports only; any
+#: other port has to be written out as ``host:port``.
+_DEFAULT_WEB_PORTS = frozenset({80, 443})
+
+
+def _parse_target(entry: str) -> tuple[str, int | None]:
+    """``host``, ``host:port`` or ``[v6]:port`` → ``(host, port-or-None)``."""
+    entry = entry.strip().lower()
+    if entry.startswith("["):
+        host, _, rest = entry[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else ""
+        return host, (int(port) if port.isdigit() else None)
+    host, sep, port = entry.rpartition(":")
+    if sep and port.isdigit() and ":" not in host:
+        return host, int(port)
+    return entry, None
+
+
+def _target_matches(host: str, port: int, entry: str) -> bool:
+    e_host, e_port = _parse_target(entry)
+    if e_host != host:
+        return False
+    if e_port is None:
+        return port in _DEFAULT_WEB_PORTS
+    return e_port == port
+
+
+def docker_host_deny_targets(docker_host: str | None) -> list[str]:
+    """The ``host:port`` spellings that reach a TCP Docker proxy.
+
+    Derived from the host's own ``docker_host`` so the operator does not have to remember
+    to deny it. The Docker API over curl bypasses every structural mask ``docker inspect``
+    output gets, and ``GET /containers/<id>/archive?path=/app`` is a tar of the
+    application directory.
+    """
+    if not docker_host:
+        return []
+    try:
+        parts = urlsplit(docker_host)
+    except ValueError:  # pragma: no cover - urlsplit is very permissive
+        return []
+    if parts.scheme != "tcp" or not parts.hostname or not parts.port:
+        return []
+    names = {parts.hostname.lower()}
+    if parts.hostname.lower() in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+        names |= {"localhost", "127.0.0.1", "[::1]"}
+    return sorted(f"{n}:{parts.port}" for n in names)
+
+
+def _check_url_host(url: str, allowed: list[str], denied: list[str] | None = None) -> None:
+    """Pin a URL's target host **and port** to this host's allowlist.
 
     Without this, ``curl`` on an internal box is an outbound exfiltration channel. The
     scheme is pinned separately by the force-injected ``--proto =http,https``.
     """
     try:
         parts = urlsplit(url)
-    except ValueError as exc:  # pragma: no cover - urlsplit is very permissive
+        port = parts.port
+    except ValueError as exc:
         raise Rejected(f"could not parse URL {url!r}: {exc}") from exc
 
     if parts.scheme not in {"http", "https"}:
@@ -394,15 +560,27 @@ def _check_url_host(url: str, allowed: list[str]) -> None:
     host = parts.hostname
     if not host:
         raise Rejected(f"URL {url!r} has no host")
+    host = host.lower()
+    if port is None:
+        port = 443 if parts.scheme == "https" else 80
+
+    for entry in denied or []:
+        if _target_matches(host, port, entry):
+            raise Rejected(
+                f"{host}:{port} is the Docker API on this host and is never a curl target",
+                "use the `docker` command instead; its output is masked, raw API JSON is not",
+            )
+
     if not allowed:
         raise Rejected(
             "this host has no permitted curl targets configured",
-            "add the target to 'curl_targets' for this host in hosts.yaml",
+            "add the target as host:port to 'curl_targets' for this host in hosts.yaml",
         )
-    if host not in allowed:
+    if not any(_target_matches(host, port, entry) for entry in allowed):
         raise Rejected(
-            f"{host!r} is not a permitted curl target for this host",
-            f"permitted targets: {', '.join(allowed)}",
+            f"{host}:{port} is not a permitted curl target for this host",
+            f"permitted targets: {', '.join(allowed)} "
+            "(a bare hostname covers ports 80 and 443 only)",
         )
 
 

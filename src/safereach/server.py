@@ -31,9 +31,21 @@ from pydantic import BaseModel, Field, create_model
 
 from .audit import AuditLog
 from .config import HostConfig, Settings, load_command_spec, load_settings
-from .redact import redact_docker_inspect, redact_text
-from .ssh import ExecResult, SSHError, SSHPool
-from .validator import Rejected, render, spec_summary, validate
+from .redact import (
+    redact_docker_inspect,
+    redact_text,
+    scrub_cgroup_cmdlines,
+    scrub_describe_environment,
+)
+from .ssh import SHELL_ANSWERED, ExecResult, SSHError, SSHPool, unrestricted_key_message
+from .validator import (
+    BUILTIN_DENY_PATHS,
+    Rejected,
+    docker_host_deny_targets,
+    render,
+    spec_summary,
+    validate,
+)
 from .versioning import fingerprint
 
 log = logging.getLogger("safereach")
@@ -79,7 +91,7 @@ class HostResult(BaseModel):
 
 class HostStatus(BaseModel):
     host: str
-    status: str = Field(description="ok | unreachable | shim-stale | shim-missing")
+    status: str = Field(description="ok | unreachable | shim-stale | shim-missing | unrestricted")
     detail: str = ""
     shim_version: str | None = None
 
@@ -155,7 +167,17 @@ def _host(app: AppContext, alias: str) -> HostConfig:
 
 
 def _host_ctx(host: HostConfig) -> dict[str, Any]:
-    return {"curl_targets": list(host.curl_targets)}
+    """The same context the shim builds from its own policy file.
+
+    Parity, not control: the shim re-derives all of this on the host. Matching it here
+    means the agent gets the same rejection message at the same point, instead of a
+    round trip to learn that `.env` is protected.
+    """
+    return {
+        "curl_targets": list(host.curl_targets),
+        "curl_deny_targets": docker_host_deny_targets(host.docker_host),
+        "deny_paths": list(BUILTIN_DENY_PATHS),
+    }
 
 
 async def _resolve_host(app: AppContext, ctx: Context[AppContext], host: str | None) -> HostConfig:
@@ -246,17 +268,22 @@ async def _ensure_shim(app: AppContext, host: HostConfig) -> None:
     that a host quietly running an older, looser allowlist is indistinguishable from a
     correctly configured one unless something checks.
     """
+    code = 0
     if host.alias in app.shim_versions:
         version = app.shim_versions[host.alias]
     else:
         try:
-            version = await app.pool.shim_version(host)
+            version, code = await app.pool.shim_probe(host)
         except SSHError as exc:
             raise ToolError(str(exc)) from exc
         app.shim_versions[host.alias] = version
 
     if version is None:
         if host.shim_required(app.settings.defaults):
+            if code == SHELL_ANSWERED:
+                # Not a missing package: a shell answered, so this key is unrestricted.
+                # Refuse, and say so in the words an operator needs to act on.
+                raise ToolError(unrestricted_key_message(host.alias))
             raise ToolError(
                 f"Host {host.alias!r} has no safereach-shim installed, so only client-side "
                 "validation would apply — which is a usability layer, not a control.\n"
@@ -285,6 +312,10 @@ def _postprocess(host: HostConfig, argv: list[str], result: ExecResult) -> ExecR
     )
     if is_inspect or argv[:3] == ["docker", "compose", "config"]:
         stdout = redact_docker_inspect(stdout, host.env_allowlist)
+    if argv[:2] == ["systemctl", "status"]:
+        stdout = scrub_cgroup_cmdlines(stdout)
+    if argv[:2] == ["kubectl", "describe"]:
+        stdout = scrub_describe_environment(stdout)
 
     return ExecResult(
         exit_code=result.exit_code,
@@ -603,11 +634,15 @@ async def check_connectivity(ctx: Context[AppContext], host: str | None = None) 
 
     async def one(cfg: HostConfig) -> HostStatus:
         try:
-            version = await app.pool.shim_version(cfg)
+            version, code = await app.pool.shim_probe(cfg)
         except SSHError as exc:
             return HostStatus(host=cfg.alias, status="unreachable", detail=str(exc))
 
         app.shim_versions[cfg.alias] = version
+        if version is None and code == SHELL_ANSWERED and cfg.shim_required(app.settings.defaults):
+            return HostStatus(
+                host=cfg.alias, status="unrestricted", detail=unrestricted_key_message(cfg.alias)
+            )
         if version is None:
             return HostStatus(
                 host=cfg.alias,
