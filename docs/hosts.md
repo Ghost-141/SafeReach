@@ -1,8 +1,35 @@
 # Managing hosts
 
-How hosts are named, what the three enrolment modes give you, and how to read logs that
-an application writes to a file inside a container. Setting hosts up in the first place
-is covered in the README's [Setting up hosts](../README.md#setting-up-hosts).
+Listing what is configured, how hosts are named, what the three enrolment modes give
+you, and how to read logs that an application writes to a file inside a container.
+Setting hosts up in the first place is covered in the README's
+[Setting up hosts](../README.md#setting-up-hosts).
+
+## Listing your hosts
+
+```bash
+safereach hosts           # a table on the terminal
+safereach hosts --json    # the same rows on stdout, for scripts
+```
+
+```
+Hosts (3) — ~/.config/safereach/hosts.yaml
+Alias           Address            User   Port   Mode          Description
+──────────────────────────────────────────────────────────────────────────
+prod-web        10.0.1.5           diag   2222   enrolled      diag@10.0.1.5 (hardened)
+langfuse-prod   203.0.113.7        diag   22     enrolled      primary postgres
+lab             ~/.ssh/config:            22     client-only   throwaway
+                lab-box
+```
+
+It reads `hosts.yaml` and nothing else — no network, works offline. **Mode** is what the
+file alone can prove: `enrolled` (explicit key, remote validator required), `ssh-config`
+(resolves through `~/.ssh/config`, so it connects as your own account), or `client-only`
+(`require_shim: false`, no host-side control at all). Whether an enrolled host is
+actually *hardened* is decided on the far end; `safereach doctor` reports that.
+
+The address is shown here on purpose. The MCP tool `list_hosts` hides it from the agent,
+which never needs to know where a host is; you wrote the file, and this is your view of it.
 
 ## Naming your hosts
 

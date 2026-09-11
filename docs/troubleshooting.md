@@ -4,10 +4,14 @@ Start with `doctor`. It checks the config, key permissions, host reachability, a
 each host's shim matches this version.
 
 ```bash
+safereach hosts           # what is configured, with addresses — no network
 safereach doctor          # config, keys, connectivity, shim versions
 safereach doctor --fix    # re-push a drifted shim
 safereach validate "journalctl -u nginx -n 200" --host myserver
 ```
+
+`hosts` answers "which machine is `prod-web`, and is it enrolled at all" without touching
+the network; `doctor` answers whether each one is reachable and hardened.
 
 ## Symptoms
 
