@@ -2127,7 +2127,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-exec",
         action="store_true",
         help="permit read-only commands INSIDE containers via docker exec "
-        "(requires POST on the docker proxy — see the README)",
+        "(requires POST on the docker proxy — see SECURITY.md)",
     )
     p.add_argument(
         "--exec-container",
