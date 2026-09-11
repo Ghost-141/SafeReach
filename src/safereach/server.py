@@ -37,7 +37,7 @@ from .redact import (
     scrub_cgroup_cmdlines,
     scrub_describe_environment,
 )
-from .ssh import ExecResult, SSHError, SSHPool
+from .ssh import SHELL_ANSWERED, ExecResult, SSHError, SSHPool, unrestricted_key_message
 from .validator import (
     BUILTIN_DENY_PATHS,
     Rejected,
@@ -91,7 +91,7 @@ class HostResult(BaseModel):
 
 class HostStatus(BaseModel):
     host: str
-    status: str = Field(description="ok | unreachable | shim-stale | shim-missing")
+    status: str = Field(description="ok | unreachable | shim-stale | shim-missing | unrestricted")
     detail: str = ""
     shim_version: str | None = None
 
@@ -268,17 +268,22 @@ async def _ensure_shim(app: AppContext, host: HostConfig) -> None:
     that a host quietly running an older, looser allowlist is indistinguishable from a
     correctly configured one unless something checks.
     """
+    code = 0
     if host.alias in app.shim_versions:
         version = app.shim_versions[host.alias]
     else:
         try:
-            version = await app.pool.shim_version(host)
+            version, code = await app.pool.shim_probe(host)
         except SSHError as exc:
             raise ToolError(str(exc)) from exc
         app.shim_versions[host.alias] = version
 
     if version is None:
         if host.shim_required(app.settings.defaults):
+            if code == SHELL_ANSWERED:
+                # Not a missing package: a shell answered, so this key is unrestricted.
+                # Refuse, and say so in the words an operator needs to act on.
+                raise ToolError(unrestricted_key_message(host.alias))
             raise ToolError(
                 f"Host {host.alias!r} has no safereach-shim installed, so only client-side "
                 "validation would apply — which is a usability layer, not a control.\n"
@@ -629,11 +634,15 @@ async def check_connectivity(ctx: Context[AppContext], host: str | None = None) 
 
     async def one(cfg: HostConfig) -> HostStatus:
         try:
-            version = await app.pool.shim_version(cfg)
+            version, code = await app.pool.shim_probe(cfg)
         except SSHError as exc:
             return HostStatus(host=cfg.alias, status="unreachable", detail=str(exc))
 
         app.shim_versions[cfg.alias] = version
+        if version is None and code == SHELL_ANSWERED and cfg.shim_required(app.settings.defaults):
+            return HostStatus(
+                host=cfg.alias, status="unrestricted", detail=unrestricted_key_message(cfg.alias)
+            )
         if version is None:
             return HostStatus(
                 host=cfg.alias,
