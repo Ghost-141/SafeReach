@@ -9,6 +9,11 @@
 # ------------------------------------------------------------------------------------
 
 defaults:
+  # Production posture. With this on, the server refuses to start if any host below is
+  # in client-only mode (require_shim: false) or resolves through ~/.ssh/config — the
+  # weaker modes become a startup error, not a warning. Nothing the agent does can
+  # change this file, which is what makes it a control.
+  production: true
   port: 22
   connect_timeout: 10
   command_timeout: 30
@@ -44,9 +49,12 @@ hosts:
     env_allowlist: [NODE_ENV, LOG_LEVEL, PORT, HOSTNAME]
 
     # --- curl -------------------------------------------------------------------
-    # The URL host must appear here. Defaults to empty, meaning curl reaches nothing —
-    # otherwise curl on an internal box is an outbound exfiltration channel.
-    curl_targets: [localhost, 127.0.0.1]
+    # Entries are host:port. A bare host means ports 80 and 443 ONLY — it used to mean
+    # every port on the box, which put the Docker API, Elasticsearch, Consul and whatever
+    # else listens on loopback one GET away. Defaults to empty, meaning curl reaches
+    # nothing. The docker_host port above is refused however this list is written.
+    # Redirects are never followed.
+    curl_targets: [localhost, 127.0.0.1, "localhost:8000"]
     curl_insecure: false # gates whether -k is accepted at all
 
     # --- elevated recipes -------------------------------------------------------
@@ -73,3 +81,8 @@ hosts:
     allow: [journalctl, systemctl, df, free, uptime, ps, ss, tail, docker, curl]
     docker_host: "tcp://127.0.0.1:2375"
     curl_targets: [localhost, 127.0.0.1]
+    # Container exec is enabled on the HOST at enrolment, never here:
+    #   safereach enroll test-local --hardened --allow-exec \
+    #       --exec-container app --exec-path /app/storage/logs/
+    # Both lists land in the host's root-owned policy file. Nothing on the wire can
+    # widen them, and with no --exec-path the content-reading commands refuse everything.

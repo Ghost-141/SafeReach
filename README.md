@@ -19,8 +19,8 @@ or reach a host it wasn't granted.
 ## Quick start
 
 ```bash
-uvx safereach@0.1.3 enroll --all      # set up every server you can already ssh to
-uvx safereach@0.1.3 install           # register with your agents
+uvx safereach@0.2.0 enroll --all      # set up every server you can already ssh to
+uvx safereach@0.2.0 install           # register with your agents
 ```
 
 > **Pre-release:** until this is on PyPI, install from source and register with
@@ -131,7 +131,7 @@ the socket proxy. A proxy bug lands on an account that cannot do much anyway.
 ### Recommended — `uvx`, pinned
 
 ```bash
-uvx safereach@0.1.3 --help
+uvx safereach@0.2.0 --help
 ```
 
 Nothing installed globally, and it is the one launch form that works identically for every
@@ -147,7 +147,7 @@ recommended.
 ### Alternative — a persistent install
 
 ```bash
-uv tool install safereach==0.1.3
+uv tool install safereach==0.2.0
 ```
 
 ### From source
@@ -201,9 +201,16 @@ Needs sudo on the target once. Additionally:
 - creates an unprivileged `diag` user — **no sudo**, **not in the `docker` group**
 - installs the shim to `/usr/local/bin` and its policy to `/etc/safereach`, both
   **root-owned**, so the account cannot rewrite what it is allowed to run
-- starts a **read-only Docker socket proxy** (`POST=0 EXEC=0`), bound to localhost
+- starts a **read-only Docker socket proxy** (`POST=0 EXEC=0`), bound to localhost — and
+  the shim refuses `curl` to that port however `curl_targets` is written
 - writes an exact-match sudoers entry for enabled recipes only — never `sudo` itself
 - makes the audit log **append-only** (`chattr +a`), so the account cannot erase its trail
+- runs every command under `nice -n 19`, `ionice -c 3` and a `prlimit` CPU cap where those
+  exist, so a diagnostic loses every scheduling contest with the workload it is diagnosing
+
+For a production fleet, set `defaults.production: true` in `hosts.yaml`. The server then
+refuses to start if any host is in client-only mode (`require_shim: false`) or resolves
+through `~/.ssh/config`, so the weaker modes are a startup error rather than a warning.
 
 ### Naming your hosts
 
@@ -278,14 +285,28 @@ flowchart TD
 
 **Layer 0 — remove the capability.** A control that deletes a field always beats one that
 filters it. `systemctl show` requires `--property` from a safe enum, so `Environment=` is
-unrequestable. `docker compose config` is denied (it renders every resolved secret and has
-no flag to suppress them); `--services` is a separate permitted path. `kubectl get` loses
-`-o yaml|json`, where inline `env:` lives.
+unrequestable, and `systemctl cat` is denied (it prints the unit file, `Environment=` and
+all). `docker inspect` has no `--format` — a Go template reaches `Config.Env` in text form,
+past the JSON mask — and `docker history` is denied (`ENV` build layers). `ps` has no
+full-format flags and its `-o` columns are an enum with no `args`/`cmd`/`command`, so
+`mysql -pSECRET` in a process list cannot be printed. `docker compose config` is denied
+(it renders every resolved secret and has no flag to suppress them); `--services` is a
+separate permitted path. `kubectl get` loses `-o yaml|json`, where inline `env:` lives,
+and `kubectl describe configmap` is denied. `curl` targets are `host:port` — a bare host
+means 80 and 443, never every service on loopback — and the host's own Docker API port is
+refused before the allowlist is consulted, so the raw API cannot be read around the mask.
 
 **Layer 1 — protected paths.** `*.env`, `*.pem`, `*.key`, `id_rsa*`, `*/.ssh/*`,
-`*/.aws/*`, `/etc/shadow` and ~30 more, checked against **every argument token** — a path
-can arrive as a flag value. The list is **compiled into the shim**: a host policy may add
-patterns, never remove them.
+`*/.aws/*`, `/etc/shadow`, `/proc/*`, `/sys/*`, `*_history`, this tool's own policy and
+binary, and ~40 more, checked against **every argument token** — a path can arrive as a
+flag value. The list is **compiled into the shim**: a host policy may add patterns, never
+remove them.
+
+**Structural scrubs.** Two outputs carry secrets in a *shape* rather than under a
+keyword, so they are rewritten by shape: every process line in a `systemctl status`
+CGroup tree is reduced to PID and executable, and every value under an `Environment:`
+heading in `kubectl describe` is masked. Neither depends on guessing what a secret looks
+like.
 
 **Layer 2 — masking by name.** Enrolment reads the *variable names* from the host's `.env`
 files and masks their values in four shapes (`KEY=v`, `KEY: v`, `"KEY": "v"`, `KEY = v`).
@@ -349,13 +370,24 @@ guesses.**
 run_in_container("app-1", "tail -n 200 /app/storage/logs/laravel.log")
 ```
 
-Enable with `enroll --hardened --allow-exec --exec-container app-1`. **Off by default.**
+Enable with:
+
+```bash
+safereach enroll myserver --hardened --allow-exec \
+    --exec-container app-1 --exec-path /app/storage/logs/
+```
+
+**Off by default**, and default-deny on both axes: `--allow-exec` requires at least one
+`--exec-container` and at least one absolute `--exec-path`. Both are written into the
+host's root-owned policy; neither can be supplied over the wire.
 
 What keeps it safe: the inner command is validated by **the same validator**, against a
 narrow in-container allowlist (`cat`, `tail`, `head`, `ls`, `stat`, `ps`, `df`, `grep`).
 `docker exec app sh -c '…'` fails because `sh` is not allowlisted — not through a special
-case. `deny_paths` still applies, so `cat /app/.env` is refused inside the container too.
-No TTY, no stdin, no interactive session.
+case. The content-reading commands (`cat`, `tail`, `head`, `grep`) may only name paths
+under an `--exec-path` prefix; `ls`, `stat`, `df` and `ps` return names and numbers. The
+protected-path list still applies, so `cat /app/.env` and `cat /proc/1/environ` are
+refused inside the container too. No TTY, no stdin, no interactive session.
 
 **The tradeoff, stated plainly:** `--allow-exec` requires `POST` on the Docker proxy, which
 also permits container create/start at the API level. The command allowlist remains the
@@ -392,6 +424,50 @@ proves only that the input was empty.
 ---
 
 ## Release notes
+
+### 0.2.0 — closes the secret-leak paths found in review
+
+Every deployed shim is refused until `safereach shim-update --all` runs: the fingerprint
+changed, and a host on the old rules is refused rather than quietly served. Upgrade with
+`uvx safereach@0.2.0 install`, then `safereach shim-update --all`.
+
+**Removed capabilities (Layer 0)** — each was reproduced returning secrets:
+- `curl_targets` entries are now `host:port`; a bare host covers 80 and 443 only. It used
+  to cover every port on the box, which put the Docker API, Elasticsearch, Consul and
+  anything else on loopback one GET away. The host's own Docker API port is refused
+  before the allowlist is consulted, however it is listed. `-L`/`--location` are denied.
+- `docker inspect` has no `--format`: a Go template reaches `Config.Env` in text form,
+  past the JSON mask. `docker history` is denied (`ENV`/`ARG` build layers).
+- `systemctl cat` is denied (prints `Environment=` verbatim). `ps` loses every full-format
+  flag; `-o` is an enumerated column alphabet without `args`/`cmd`/`command`.
+- `run_in_container`: `cat`/`tail`/`head`/`grep` may only read under `--exec-path`
+  prefixes written into the host policy, and refuse everything when none are set.
+  `--allow-exec` now requires `--exec-container` and `--exec-path`. `/proc/*`, `/sys/*`
+  and shell history files join the compiled-in deny list, as do this tool's own policy
+  file and binary.
+- `du` loses `/home/` and is capped at depth 3. `kubectl describe configmap` is denied,
+  and resource abbreviations (`sa`, `cm`) are canonicalised before any deny is checked.
+
+**Structural scrubs** — by shape, not by keyword: `systemctl status` CGroup lines are
+reduced to PID and executable; values under `Environment:` in `kubectl describe` are
+masked; `Cmd`/`Entrypoint`/`Args` in `docker inspect` JSON go through the argument
+patterns in place.
+
+**Redaction (last layer)** — identifiers ending in `_KEY`, `_SALT`, `_DSN`, `_PASS`,
+`PASSPHRASE`; `--password x` / `--token=x` style arguments; `mysql -pX`, `redis-cli -a X`;
+Stripe, Google, Anthropic, OpenAI, GitLab, GitHub fine-grained, Slack app, SendGrid, Vault,
+Docker Hub, npm, PyPI and AWS STS token formats.
+
+**Host-side cost bound** — every command runs under `nice -n 19`, `ionice -c 3` and
+`prlimit --cpu` where present.
+
+**`defaults.production: true`** — the server refuses to start with any client-only or
+`~/.ssh/config` host, so the weaker modes are a startup error.
+
+**Enforcement** — the spec linter now fails the build if any of the above is added back,
+if the protected-path list shrinks below a frozen floor, or if any path prefix could reach
+the policy file or the shim. The reproduction strings from the review are in the attack
+corpus and run through the built shim as well as the in-process validator.
 
 ### 0.1.3
 
@@ -499,8 +575,11 @@ Check it against these before adding:
 - Can it **spawn a child process**? (`-exec`, `--to-command`, `!` escapes) → don't add it
 - Can it **write a file**? → deny those flags explicitly
 - Can it **read an arbitrary path**? → constrain `path_prefixes`
+- Can it **print another process's arguments or environment**? (`ps -f`, `systemctl cat`,
+  a `--format` template) → don't add the flag; argv and environments are where passwords live
 - Can it **stream forever**? (`-f`, `--follow`) → deny; the timeout is a backstop, not a control
 - Can it **read options from a file**? (`curl -K`) → deny; it bypasses the allowlist
+- Can it **follow a redirect or reach a port**? → pin `host:port`, deny `-L`
 
 Then run `pytest`. The spec linter will refuse anything mutating, and will require you to
 declare whether the binary's positionals are commands or data.
