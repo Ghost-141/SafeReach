@@ -176,8 +176,16 @@ Before pointing an agent at a host that matters:
 - [ ] Host audit log `/var/log/safereach.jsonl` shipped to wherever your other logs go
 - [ ] Re-enrolled one non-critical host first after any upgrade that says "re-enrol"
 
-Naming and renaming hosts, the comparison of the three enrolment modes, and reading logs
-inside containers: [docs/hosts.md](docs/hosts.md).
+Taking a host out again is one command, and it proves the key is dead before it forgets
+the host:
+
+```bash
+safereach unenroll myserver --yes          # keeps the diag account and the audit log
+safereach unenroll myserver --yes --remove-user --purge-log
+```
+
+Naming and renaming hosts, the comparison of the three enrolment modes, removing a host,
+and reading logs inside containers: [docs/hosts.md](docs/hosts.md).
 
 ---
 
@@ -239,7 +247,7 @@ Every message the tool can produce, and what to do about it:
 |---|---|
 | [SECURITY.md](SECURITY.md) | Threat model in full, the four secret-protection layers, non-destruction by construction, the hardened host footprint, and how to report a vulnerability |
 | [docs/architecture.md](docs/architecture.md) | Request lifecycle and defence-in-depth diagrams |
-| [docs/hosts.md](docs/hosts.md) | Listing hosts, naming and renaming, enrolment modes compared, container inspection |
+| [docs/hosts.md](docs/hosts.md) | Listing hosts, naming and renaming, enrolment modes compared, removing a host, container inspection |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptoms, causes, and the SSH config override |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup, the test layers, extending the allowlist, releasing |
 | [CHANGELOG.md](CHANGELOG.md) | What changed, and what to run on each host after upgrading |

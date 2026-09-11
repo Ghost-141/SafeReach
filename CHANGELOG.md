@@ -6,6 +6,13 @@ refuses every host until `safereach shim-update --all` runs.
 
 ## Unreleased
 
+- New `safereach unenroll <host>`: takes a host out. Removes our key line, the shim and
+  policy, and in hardened mode the sshd drop-in, sudoers entry, Docker proxy and the diag
+  account's key, then **proves the enrolled key no longer authenticates** before dropping
+  the host from `hosts.yaml`. The diag account and the host's audit log are kept unless
+  `--remove-user` / `--purge-log` say otherwise. `--local-only` drops the entry for a host
+  that no longer exists. Exercised end to end: the suite unenrols the rig host last and
+  checks nothing is left.
 - New `safereach hosts`: every configured host as a table — alias, address, user, port,
   mode (`enrolled`, `ssh-config`, `client-only`) and description. Reads `hosts.yaml`
   only, so it is instant and works offline. `--json` prints the same list on stdout for

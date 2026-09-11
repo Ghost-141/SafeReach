@@ -425,3 +425,55 @@ def test_production_flag_refuses_client_only_hosts(
     proc = host.safereach("--config", str(cfg), "doctor", check=False)
     assert proc.returncode != 0
     assert "production is true" in proc.stdout + proc.stderr
+
+
+# --------------------------------------------------------------------------------------
+# Last: take the host out again, and prove nothing is left. Module-scoped fixtures mean
+# this must be the final test in the file.
+# --------------------------------------------------------------------------------------
+
+
+def test_unenroll_removes_everything_and_kills_the_key(
+    host: rig.Host, enrolled: dict[str, str]
+) -> None:
+    # Other local users could still ssh in as themselves afterwards; the admin route must
+    # survive the cleanup, and the enrolled key must not.
+    proc = host.safereach("unenroll", host.alias, "--yes", "--remove-user", check=False)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    assert "enrolled key refused" in out
+    assert "sshd removed" in out and "proxy removed" in out and "account removed" in out
+    assert "log kept" in out
+
+    # Root-owned state is gone, and sshd is still healthy without the drop-in.
+    for path in (
+        "/usr/local/bin/safereach-shim",
+        "/etc/safereach",
+        "/etc/sudoers.d/safereach",
+        "/etc/ssh/sshd_config.d/zz-safereach-diag.conf",
+        "/etc/tmpfiles.d/safereach.conf",
+        "/run/safereach",
+    ):
+        assert (
+            host.exec("test", "-e", path, check=False) == ""
+            and rig._run(
+                "docker", "exec", rig.CONTAINER, "test", "-e", path, check=False
+            ).returncode
+            != 0
+        ), path
+    host.exec("sshd", "-t")
+    assert "safereach-docker-proxy" not in host.exec("docker", "ps", "-a", "--format", "{{.Names}}")
+    assert rig._run("docker", "exec", rig.CONTAINER, "id", "diag", check=False).returncode != 0
+    # The audit log survives, readable by root, no longer append-only.
+    log = host.exec("cat", "/var/log/safereach.jsonl")
+    assert '"decision":"allowed"' in log and '"decision":"rejected"' in log
+    assert host.exec("stat", "-c", "%a", "/var/log/safereach.jsonl").strip() == "640"
+    assert "a" not in host.exec("lsattr", "/var/log/safereach.jsonl").split()[0]
+
+    # The enrolled key is dead; the admin key still works; the entry is gone locally.
+    assert _diag(host, enrolled, "@ping").returncode != 0
+    assert host.ssh("true").returncode == 0
+    hosts_yaml = (host.home / ".config" / "safereach" / "hosts.yaml").read_text(encoding="utf-8")
+    assert host.alias not in hosts_yaml
+    assert list((host.home / ".config" / "safereach").glob("hosts.yaml.bak-*"))
+    assert "no hosts configured" in (host.safereach("hosts", check=False).stderr)

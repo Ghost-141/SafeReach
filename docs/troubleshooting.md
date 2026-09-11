@@ -24,6 +24,8 @@ the network; `doctor` answers whether each one is reachable and hardened.
 | `is not a permitted curl target` | `curl_targets` entries are `host:port`; a bare host means ports 80 and 443 only |
 | `no permitted paths configured` | `--allow-exec` needs at least one `--exec-path` at enrolment |
 | `production is true, but:` | A client-only or `~/.ssh/config` host in a config with `defaults.production: true` |
+| `the enrolled key STILL authenticates` (from `unenroll`) | Cleanup ran but the key line is still in an `authorized_keys` somewhere — an account other than the one enrolment used, or a `~/.ssh/authorized_keys2`. Remove it by hand; the host stays in `hosts.yaml` until the probe fails |
+| `no passwordless sudo via this route` (from `unenroll`) | The user-level cleanup ran, but hardened state needs root. Re-run with `--via <admin alias>` or `--admin-user` |
 | `Permission denied (publickey)` | Remote `~/.ssh` must be `700`, `authorized_keys` `600` |
 | `Too many authentication failures` | Add `IdentitiesOnly yes` to `~/.ssh/config` |
 | Agent reports a parse error | Something wrote to stdout, which carries JSON-RPC; check stderr |
