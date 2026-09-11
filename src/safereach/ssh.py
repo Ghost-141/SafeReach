@@ -19,7 +19,7 @@ import asyncssh
 
 from .config import Defaults, HostConfig
 
-__all__ = ["SSHPool", "ExecResult", "SSHError"]
+__all__ = ["SSHPool", "ExecResult", "SSHError", "SHELL_ANSWERED", "unrestricted_key_message"]
 
 #: Bound concurrent channels per host so a fan-out cannot exhaust MaxSessions.
 _MAX_CHANNELS_PER_HOST = 4
@@ -78,6 +78,12 @@ class SSHPool:
         asyncssh pick up ``SSH_AUTH_SOCK``. That is agent *use*, not agent *forwarding*:
         the socket is read locally to sign a challenge and is never exposed to the remote
         host.
+
+        **When a key is explicit, the agent is asked for that identity only.** asyncssh
+        otherwise tries every agent key *before* ``client_keys``, and on a host where the
+        operator's personal key is also authorised for the same account, that key wins —
+        and it is the one without the forced command. Pinning ``agent_identities`` keeps
+        "the enrolled key" and "the key actually used" the same thing.
         """
         options: dict[str, Any] = {}
 
@@ -87,6 +93,10 @@ class SSHPool:
                 f"SSH key for host {host.alias!r} is missing or unreadable. "
                 "Check the 'key' entry in hosts.yaml."
             )
+        if key_path is not None and host.use_agent:
+            identity = _public_identity(key_path)
+            if identity is not None:
+                options["agent_identities"] = [identity]
 
         if host.uses_ssh_config:
             config_path = Path("~/.ssh/config").expanduser()
@@ -221,20 +231,56 @@ class SSHPool:
             duration_ms=duration_ms,
         )
 
-    async def shim_version(self, host: HostConfig) -> str | None:
-        """Ask the host's shim for its version stamp.
+    async def shim_probe(self, host: HostConfig) -> tuple[str | None, int]:
+        """Ask the host's shim for its version stamp; return ``(version, exit_code)``.
 
-        Returns ``None`` when no shim is installed — which is a legitimate state during
-        rollout, not an error. The caller decides whether to allow it.
+        ``version`` is ``None`` when no shim answered. The exit code says *who* answered
+        instead: 127 is a login shell reporting ``@version: command not found``, which
+        means the forced command did not run for this key — either no shim is installed,
+        or the connection authenticated with a key that has no forced command. Both are
+        "no shim" to the handshake, but only one of them is a security finding.
         """
-        try:
-            result = await self.run(host, "@version")
-        except SSHError:
-            raise
+        result = await self.run(host, "@version")
         if result.exit_code != 0:
-            return None
+            return None, result.exit_code
         version = result.stdout.strip()
-        return version or None
+        return (version or None), result.exit_code
+
+    async def shim_version(self, host: HostConfig) -> str | None:
+        """The version alone — a legitimate ``None`` during an incremental rollout."""
+        version, _ = await self.shim_probe(host)
+        return version
+
+
+#: What the login shell says when it, rather than the shim, received ``@version``.
+SHELL_ANSWERED = 127
+
+
+def unrestricted_key_message(alias: str) -> str:
+    """The finding, phrased for both the agent and `doctor`."""
+    return (
+        f"SECURITY: the login shell on {alias!r} answered the probe, not safereach-shim. "
+        "This key has unrestricted shell access to that account. Either no shim is "
+        "installed, or ssh authenticated with a different key than the enrolled one. "
+        "Re-run `safereach enroll --hardened` for this host and check `safereach doctor`."
+    )
+
+
+def _public_identity(key_path: Path) -> asyncssh.SSHKey | None:
+    """The public half of an explicit key, for pinning the agent to it.
+
+    Read from the ``.pub`` sibling ``enroll`` writes; derived from the private key when
+    that is absent and the key is unencrypted. An encrypted key with no ``.pub`` cannot
+    be pinned, and the caller leaves the agent unrestricted rather than failing: that is
+    the pre-existing behaviour, and hardened hosts have only the one key anyway.
+    """
+    pub = Path(str(key_path) + ".pub")
+    if pub.is_file():
+        with contextlib.suppress(Exception):
+            return asyncssh.read_public_key(str(pub))
+    with contextlib.suppress(Exception):
+        return asyncssh.read_private_key(str(key_path)).convert_to_public()
+    return None
 
 
 def _as_text(value: Any) -> str:

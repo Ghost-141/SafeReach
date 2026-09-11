@@ -1,8 +1,16 @@
 name: CI
 
+# Every push to any branch, plus pull requests. A PR from a branch in this repo runs
+# twice (once for the push, once for the PR). That duplicate is cheap — the host image
+# is cached — and the alternative, skipping the PR run's jobs, makes the required
+# `ci-ok` check fail on every PR: a skipped `needs` job is not a success.
 on:
-  push: { branches: [main] }
+  push:
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -24,6 +32,43 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run python shim/build.py
 
+  # The controls that matter most write to a real host as root: the hardened enrolment,
+  # the sshd Match block, sudoers, the proxy's unix socket, the forced command over a
+  # real SSH channel. tests/e2e enrols a disposable production-like host (systemd, sshd,
+  # sudo, nested dockerd, in a privileged container) and replays the security review's
+  # probes against the real shim. It runs on every push, and ci-ok requires it.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.11
+      - run: uv venv --python 3.11
+      - run: uv pip install -e ".[dev]"
+      # The image is identical on every push; rebuilding it was 90% of the job's time.
+      # Buildx with the Actions cache turns a 7-minute build into a cache hit.
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the disposable host image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: tests/e2e
+          tags: safereach-e2e-host:latest
+          load: true
+          cache-from: type=gha,scope=e2e-host
+          cache-to: type=gha,scope=e2e-host,mode=max
+      - name: End-to-end suite against the real host
+        env:
+          SAFEREACH_E2E: "1"
+        run: uv run pytest tests/e2e -v
+      - name: Host logs on failure
+        if: failure()
+        run: |
+          docker ps -a || true
+          docker logs --tail 100 safereach-e2e-host || true
+          docker exec safereach-e2e-host journalctl --no-pager -n 100 || true
+          docker exec safereach-e2e-host cat /var/log/safereach.jsonl || true
+
   # A single stable check name to require in branch protection.
   #
   # The matrix above produces `test (3.11)`, `test (3.12)`, `test (3.13)` — three names
@@ -33,11 +78,13 @@ jobs:
   # `if: always()` matters: without it, a skipped or failed matrix leg would leave this
   # job skipped, and GitHub treats a skipped required check as passing.
   ci-ok:
-    needs: test
+    needs: [test, e2e]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: All matrix legs must have succeeded
+      - name: All matrix legs and the end-to-end suite must have succeeded
         run: |
           echo "test result: ${{ needs.test.result }}"
+          echo "e2e result: ${{ needs.e2e.result }}"
           [ "${{ needs.test.result }}" = "success" ] || exit 1
+          [ "${{ needs.e2e.result }}" = "success" ] || exit 1

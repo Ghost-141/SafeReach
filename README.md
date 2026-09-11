@@ -11,7 +11,8 @@ or reach a host it wasn't granted.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
 [![MCP](https://img.shields.io/badge/MCP-2026--07--28-green)](https://modelcontextprotocol.io)
-[![Tests](https://img.shields.io/badge/tests-832%20passing-brightgreen)](#testing)
+[![CI](https://github.com/Ghost-141/SafeReach/actions/workflows/ci.yml/badge.svg)](https://github.com/Ghost-141/SafeReach/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/safereach)](https://pypi.org/project/safereach/)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
 ---
@@ -19,8 +20,8 @@ or reach a host it wasn't granted.
 ## Quick start
 
 ```bash
-uvx safereach@0.1.1 enroll --all      # set up every server you can already ssh to
-uvx safereach@0.1.1 install           # register with your agents
+uvx safereach@0.3.0 enroll --all      # set up every server you can already ssh to
+uvx safereach@0.3.0 install           # register with your agents
 ```
 
 > **Pre-release:** until this is on PyPI, install from source and register with
@@ -126,12 +127,62 @@ the socket proxy. A proxy bug lands on an account that cannot do much anyway.
 
 ---
 
+## Threat model
+
+What this is built to hold against, and what it is not.
+
+**Assumed hostile:** the agent, and everything in its context. A prompt injection in a log
+line the agent just read is the expected attack, not an edge case. Everything the agent can
+reach — the MCP server, `hosts.yaml`, the local audit log — is therefore treated as
+influenceable. The controls that count live on the host: the shim with its embedded spec,
+its root-owned policy file, the forced-command key, sudoers, and the sshd `Match` block.
+
+**Assumed trusted:** root on the managed host, the operator running `enroll`, and the
+machine `enroll` runs from at the moment it runs. If any of those is compromised, this
+tool is not the boundary.
+
+**Holds, by construction:**
+
+- No state change on a host, in Docker, or in Kubernetes. Every allowlisted binary is
+  read-only; the spec linter probes every mutating verb in every position and fails the
+  build if one is reachable.
+- No shell, no pipes, no subshells, no file writes, no arbitrary path reads, no outbound
+  requests except to `host:port` pairs you listed.
+- No secret file can be named, in any argument, in any container.
+- No command can print another process's argv or environment.
+- Docker is reached only through a read-only proxy on a diag-only socket; the agent's
+  account is not in the `docker` group and has no sudo beyond named recipes.
+- A host running an older allowlist is refused, not served.
+
+**Does not hold, and cannot:**
+
+- **Secrets your application writes to its own logs.** A connection string in a stack
+  trace, a token in a request URL. Redaction catches the shapes it knows; the fix is on
+  the application side.
+- **Names.** Variable names, file names under `/opt`, container names are visible. That
+  is deliberate — it is what lets the agent reason about configuration.
+- **Client-only mode** (`discover`, or `require_shim: false`). There is no host-side
+  control at all. `defaults.production: true` refuses to start with it.
+
+---
+
 ## Installation
+
+### Requirements
+
+| Where | Needs |
+|---|---|
+| Your machine (runs the MCP server) | Python 3.11+, OpenSSH client, `uv` or `pipx`. Linux and macOS tested; Windows via WSL. |
+| Each managed host | Any Python 3, OpenSSH server. For `--hardened`: `sudo`, `systemd`, and Docker if you want container diagnostics. Debian/Ubuntu and RHEL-family tested. |
+| The agent | Anything that speaks MCP over stdio: Claude Code, Claude Desktop, Codex, Cursor, Windsurf, VS Code, Zed, Gemini CLI. `safereach install` registers with each. |
+
+Nothing is installed on a managed host beyond one stdlib-only Python file and, in hardened
+mode, one container.
 
 ### Recommended — `uvx`, pinned
 
 ```bash
-uvx safereach@0.1.1 --help
+uvx safereach@0.3.0 --help
 ```
 
 Nothing installed globally, and it is the one launch form that works identically for every
@@ -147,7 +198,7 @@ recommended.
 ### Alternative — a persistent install
 
 ```bash
-uv tool install safereach==0.1.1
+uv tool install safereach==0.3.0
 ```
 
 ### From source
@@ -200,10 +251,45 @@ Needs sudo on the target once. Additionally:
 
 - creates an unprivileged `diag` user — **no sudo**, **not in the `docker` group**
 - installs the shim to `/usr/local/bin` and its policy to `/etc/safereach`, both
-  **root-owned**, so the account cannot rewrite what it is allowed to run
-- starts a **read-only Docker socket proxy** (`POST=0 EXEC=0`), bound to localhost
-- writes an exact-match sudoers entry for enabled recipes only — never `sudo` itself
+  **root-owned**, so the account cannot rewrite what it is allowed to run. The policy is
+  `0640 root:diag`: it holds the HMAC key for the secret digests, and no other local
+  account can read it
+- starts a **read-only Docker socket proxy** (`POST=0 EXEC=0`), pinned by image digest,
+  listening on a **unix socket** (`/run/safereach/docker.sock`, mode `0660`, diag group)
+  rather than a TCP port — reachable by `docker` running as `diag` and by nothing else.
+  Where the socket bind is not possible it falls back to loopback TCP limited to the
+  diag uid by `iptables`, and the shim refuses `curl` to that port however
+  `curl_targets` is written
+- writes an exact-match sudoers entry for enabled recipes only — never `sudo` itself —
+  with the binary path resolved on that host, so `/bin/dmesg` and `/usr/bin/dmesg`
+  hosts both match
+- adds an sshd `Match User diag` drop-in (`MaxSessions 4`, no forwarding, no TTY),
+  validated with `sshd -t` before it is kept and reloaded only if it validates
 - makes the audit log **append-only** (`chattr +a`), so the account cannot erase its trail
+- offers **only the enrolled key** to the host: the SSH agent is asked for that identity
+  and no other, so a personal key that is also authorised there can never win the
+  handshake and land in an account without the forced command
+- runs every command under `nice -n 19`, `ionice -c 3` and a `prlimit` CPU cap where those
+  exist, so a diagnostic loses every scheduling contest with the workload it is diagnosing
+
+For a production fleet, set `defaults.production: true` in `hosts.yaml`. The server then
+refuses to start if any host is in client-only mode (`require_shim: false`) or resolves
+through `~/.ssh/config`, so the weaker modes are a startup error rather than a warning.
+
+### Production checklist
+
+Before pointing an agent at a host that matters:
+
+- [ ] Enrolled with `--hardened`, never plain `enroll` or `discover`
+- [ ] `defaults.production: true` in `hosts.yaml`, so weaker modes cannot creep back in
+- [ ] `safereach doctor` shows every host `hardened`, shim fingerprint matching
+- [ ] `curl_targets` lists only the `host:port` pairs the agent needs, or is empty
+- [ ] `--allow-exec` off, or on with explicit `--exec-container` and `--exec-path`
+- [ ] `--elevated` recipes limited to what is needed (`dmesg-recent` is usually enough)
+- [ ] `hosts.yaml` and the key under `~/.config/safereach/keys` are mode `0600`
+- [ ] Agent registered with `safereach install` (version-pinned `uvx`), not `--unpinned`
+- [ ] Host audit log `/var/log/safereach.jsonl` shipped to wherever your other logs go
+- [ ] Re-enrolled one non-critical host first after any upgrade that says "re-enrol"
 
 ### Naming your hosts
 
@@ -278,14 +364,28 @@ flowchart TD
 
 **Layer 0 — remove the capability.** A control that deletes a field always beats one that
 filters it. `systemctl show` requires `--property` from a safe enum, so `Environment=` is
-unrequestable. `docker compose config` is denied (it renders every resolved secret and has
-no flag to suppress them); `--services` is a separate permitted path. `kubectl get` loses
-`-o yaml|json`, where inline `env:` lives.
+unrequestable, and `systemctl cat` is denied (it prints the unit file, `Environment=` and
+all). `docker inspect` has no `--format` — a Go template reaches `Config.Env` in text form,
+past the JSON mask — and `docker history` is denied (`ENV` build layers). `ps` has no
+full-format flags and its `-o` columns are an enum with no `args`/`cmd`/`command`, so
+`mysql -pSECRET` in a process list cannot be printed. `docker compose config` is denied
+(it renders every resolved secret and has no flag to suppress them); `--services` is a
+separate permitted path. `kubectl get` loses `-o yaml|json`, where inline `env:` lives,
+and `kubectl describe configmap` is denied. `curl` targets are `host:port` — a bare host
+means 80 and 443, never every service on loopback — and the host's own Docker API port is
+refused before the allowlist is consulted, so the raw API cannot be read around the mask.
 
 **Layer 1 — protected paths.** `*.env`, `*.pem`, `*.key`, `id_rsa*`, `*/.ssh/*`,
-`*/.aws/*`, `/etc/shadow` and ~30 more, checked against **every argument token** — a path
-can arrive as a flag value. The list is **compiled into the shim**: a host policy may add
-patterns, never remove them.
+`*/.aws/*`, `/etc/shadow`, `/proc/*`, `/sys/*`, `*_history`, this tool's own policy and
+binary, and ~40 more, checked against **every argument token** — a path can arrive as a
+flag value. The list is **compiled into the shim**: a host policy may add patterns, never
+remove them.
+
+**Structural scrubs.** Two outputs carry secrets in a *shape* rather than under a
+keyword, so they are rewritten by shape: every process line in a `systemctl status`
+CGroup tree is reduced to PID and executable, and every value under an `Environment:`
+heading in `kubectl describe` is masked. Neither depends on guessing what a secret looks
+like.
 
 **Layer 2 — masking by name.** Enrolment reads the *variable names* from the host's `.env`
 files and masks their values in four shapes (`KEY=v`, `KEY: v`, `"KEY": "v"`, `KEY = v`).
@@ -349,13 +449,24 @@ guesses.**
 run_in_container("app-1", "tail -n 200 /app/storage/logs/laravel.log")
 ```
 
-Enable with `enroll --hardened --allow-exec --exec-container app-1`. **Off by default.**
+Enable with:
+
+```bash
+safereach enroll myserver --hardened --allow-exec \
+    --exec-container app-1 --exec-path /app/storage/logs/
+```
+
+**Off by default**, and default-deny on both axes: `--allow-exec` requires at least one
+`--exec-container` and at least one absolute `--exec-path`. Both are written into the
+host's root-owned policy; neither can be supplied over the wire.
 
 What keeps it safe: the inner command is validated by **the same validator**, against a
 narrow in-container allowlist (`cat`, `tail`, `head`, `ls`, `stat`, `ps`, `df`, `grep`).
 `docker exec app sh -c '…'` fails because `sh` is not allowlisted — not through a special
-case. `deny_paths` still applies, so `cat /app/.env` is refused inside the container too.
-No TTY, no stdin, no interactive session.
+case. The content-reading commands (`cat`, `tail`, `head`, `grep`) may only name paths
+under an `--exec-path` prefix; `ls`, `stat`, `df` and `ps` return names and numbers. The
+protected-path list still applies, so `cat /app/.env` and `cat /proc/1/environ` are
+refused inside the container too. No TTY, no stdin, no interactive session.
 
 **The tradeoff, stated plainly:** `--allow-exec` requires `POST` on the Docker proxy, which
 also permits container create/start at the API level. The command allowlist remains the
@@ -366,7 +477,7 @@ control; the proxy no longer is. Leave it off unless you need it.
 ## Testing
 
 ```bash
-uv run pytest              # 832 tests
+uv run pytest              # the unit and differential suites, about a minute
 uv run ruff check .
 uv run python shim/build.py
 ```
@@ -383,6 +494,11 @@ uv run python shim/build.py
 | `test_enroll` | The remote script never clobbers existing `authorized_keys` |
 | `test_naming` | Alias validation, stable ids, name-file direction resolution |
 | `test_rename` | Rewriting `hosts.yaml` in place without corrupting it |
+| `test_exec_inner` | The in-container allowlist: prefixes from host policy, `/proc` denied |
+| `test_host_state` | The remote scripts: policy mode, sudoers, sshd drop-in, digest key never on argv |
+| `test_ssh_auth` | The SSH agent is pinned to the enrolled key |
+| `test_wheel` | The built wheel, in a clean venv, can produce a working shim |
+| `e2e/` | All of the above executed on a real host — see below |
 
 The canary suite is the strongest evidence available: per-pattern tests prove the patterns
 work, but only a canary suggests nothing escapes. Each case has a **negative control**
@@ -391,64 +507,30 @@ proves only that the input was empty.
 
 ---
 
-## Release notes
+### End to end, against a real host
 
-### 0.1.1
+Everything above runs in-process. The controls that matter most — the hardened enrolment
+as root, the sshd `Match` block, the sudoers file, the proxy's unix socket, the forced
+command over a real SSH channel — are exercised for real against a disposable
+production-like host: Ubuntu 24.04 with systemd, sshd, sudo, journald and its own Docker
+daemon, in a privileged container on your machine.
 
-**Terminal output**
-- `--help`, `doctor`, `discover` and `install --list` render as tables with a shared
-  colour vocabulary, so a status means the same thing in every command
-- the console is bound to **stderr**, never stdout — stdout carries JSON-RPC in server
-  mode, and one styled byte there corrupts the stream for every agent. Five tests hold
-  that line, including one asserting the bundled shim still imports no `rich`
-- colour is dropped when piped and when `NO_COLOR` is set
+```bash
+SAFEREACH_E2E=1 uv run pytest tests/e2e -v      # needs Docker; a few minutes
+python -m tests.e2e.rig up                        # or keep one running to poke at
+python -m tests.e2e.rig destroy
+```
 
-**Help**
-- commands are grouped by task with a quick start on top, rather than listed
-  alphabetically — the generated list said which commands existed, not which to run first
-- every subcommand gained a description; `help=` only ever fed the parent's listing, so
-  `safereach enroll --help` had been flags and nothing else
-- `safereach` with no arguments on a terminal now shows help instead of starting a silent
-  server and appearing to hang. Agents launch it over a pipe, so the two cases are
-  distinguishable
-- added `--version`
+It enrols the host with `--hardened --allow-exec`, then asserts on the host itself
+(policy `0640 root:diag`, socket `0660`, `sshd -T -C user=diag`, `visudo -c`), replays
+every reproduction string from the security review through the real shim, checks the
+legal diagnostics come back with their secrets scrubbed, and confirms another local
+account can read neither the policy nor the socket.
 
-**Release automation**
-- publishing is triggered by a version change rather than by merging. PyPI versions are
-  immutable, so publishing on every merge would fail on the first merge that did not bump
-- PEP 740 attestations bind each artifact to the commit and workflow that built it
-- the GitHub release is tagged only after a successful upload, so a tag always names
-  something installable
-
-### 0.1.0 — initial release
-
-**Core**
-- MCP server (SDK v2, stdio) exposing eight read-only diagnostic tools
-- Two-sided validation: client-side for error quality, remote shim as the real boundary
-- Structured argv over the wire — no tokenisation on the remote side, so the two
-  validators cannot disagree about quoting
-- Connection pooling, per-command timeouts, output caps, concurrent fan-out
-
-**Security**
-- SSH forced command; enrolment verifies the restriction and refuses the host if an escape
-  succeeds
-- Hardened mode: unprivileged account, root-owned shim and policy, read-only Docker proxy,
-  exact-match sudoers, append-only audit log
-- Four-layer secret protection (structural · paths · names · digests), applied on the host
-- Spec linter enforcing non-destructiveness at build time
-- Shim fingerprinting: a drifted host is refused, not warned about
-
-**Allowlist** — `journalctl`, `systemctl`, `dmesg`, `df`, `du`, `free`, `uptime`, `nproc`,
-`hostnamectl`, `ps`, `ss`, `ip`, `tail`, `head`, `grep`, `stat`, `ls`, `docker`, `curl`,
-`kubectl`
-
-**Known limits**
-- Masking is best-effort for unstructured text; Layers 0–1 are structural, 2–3 are not
-- The `diag` account is in `adm`, so it can read `/var/log` — inherent to being useful
-- Kubernetes RBAC is not automated; the allowlist is not a substitute for a read-only Role
-- ~900 lines of security-critical code with no external audit yet
-
----
+CI runs it on **every push and pull request**, and the `ci-ok` check requires it. The
+publish workflow runs it again on the exact tree being released, before the wheel is
+built, so nothing reaches PyPI that has not been enrolled onto a real host in the same
+run.
 
 ## Extending the allowlist
 
@@ -472,8 +554,11 @@ Check it against these before adding:
 - Can it **spawn a child process**? (`-exec`, `--to-command`, `!` escapes) → don't add it
 - Can it **write a file**? → deny those flags explicitly
 - Can it **read an arbitrary path**? → constrain `path_prefixes`
+- Can it **print another process's arguments or environment**? (`ps -f`, `systemctl cat`,
+  a `--format` template) → don't add the flag; argv and environments are where passwords live
 - Can it **stream forever**? (`-f`, `--follow`) → deny; the timeout is a backstop, not a control
 - Can it **read options from a file**? (`curl -K`) → deny; it bypasses the allowlist
+- Can it **follow a redirect or reach a port**? → pin `host:port`, deny `-L`
 
 Then run `pytest`. The spec linter will refuse anything mutating, and will require you to
 declare whether the binary's positionals are commands or data.
@@ -484,7 +569,29 @@ decorative.
 
 ---
 
+## Upgrading
+
+Agents are pinned to a version (`uvx safereach@X.Y.Z`), so nothing changes until you say
+so. An upgrade is two steps, and the [changelog](CHANGELOG.md) says which apply:
+
+```bash
+uvx safereach@X.Y.Z install       # repoint every agent at the new version
+safereach shim-update --all       # when the release changed the allowlist or the shim
+safereach enroll <host> --hardened  # when the release changed root-owned host state
+```
+
+Until `shim-update` runs, a host on the old rules is **refused**, with a message naming
+the fingerprints. That is deliberate: a host quietly running an older, looser allowlist is
+the failure mode this tool exists to prevent. Enrolment is idempotent, so re-running it
+is always safe.
+
+---
+
 ## Troubleshooting
+
+`SAFEREACH_SSH_CONFIG=/path/to/ssh_config` makes every `ssh` and `scp` safereach runs use
+that file instead of `~/.ssh/config`. OpenSSH resolves `~` from the passwd entry, not
+`$HOME`, so this is the only way to point enrolment at a config kept elsewhere.
 
 ```bash
 safereach doctor          # config, keys, connectivity, shim versions
@@ -495,7 +602,11 @@ safereach validate "journalctl -u nginx -n 200" --host myserver
 | Symptom | Cause |
 |---|---|
 | `no safereach-shim installed` | Run `safereach enroll <host>` |
-| `shim <x> != expected <y>` | Spec changed; `doctor --fix` |
+| `shim <x> != expected <y>` | Spec changed; `doctor --fix` or `shim-update --all` |
+| `SECURITY: the login shell … answered` | The key that connected has no forced command; re-enrol `--hardened` and check `doctor` |
+| `is the Docker API on this host` | curl never reaches the proxy; use `docker` |
+| `no permitted paths configured` | `--allow-exec` needs `--exec-path` at enrolment |
+| `production is true, but:` | A client-only or `~/.ssh/config` host in a production config |
 | `Permission denied (publickey)` | Remote `~/.ssh` must be 700, `authorized_keys` 600 |
 | `Too many authentication failures` | Add `IdentitiesOnly yes` to `~/.ssh/config` |
 | Agent reports a parse error | Something wrote to stdout; check stderr |
@@ -514,8 +625,9 @@ gh pr create --fill        # merge through review as usual
 
 When that PR merges, the publish workflow sees `pyproject.toml` changed, compares the
 version against the previous commit, confirms it is not already on PyPI, then runs the
-spec linter, the full suite, lint, format check, the build, a README render check, and a
-clean-environment install of the built wheel — and only then uploads. The GitHub release
+spec linter, the full suite, lint, format check, the end-to-end suite against a real
+host, the build, a README render check, and a clean-environment install of the built wheel
+that must produce a working shim — and only then uploads. The GitHub release
 is tagged afterwards, so a tag always names something that is actually installable.
 
 Merging anything that does not change the version is silently a no-op.
@@ -530,6 +642,16 @@ that produced it. That matters for a package people install and then point at th
 production servers; the attestation is shown on the PyPI project page.
 
 `Actions → Publish → Run workflow` still allows a manual run, including to TestPyPI.
+
+---
+
+## Contributing
+
+Contributions are welcome, and the bar is written down: [CONTRIBUTING.md](CONTRIBUTING.md)
+covers the development setup, the three test layers, how to add a binary to the allowlist
+safely, and what a pull request needs. Security issues go through
+[SECURITY.md](SECURITY.md), not the issue tracker. Release history is in
+[CHANGELOG.md](CHANGELOG.md).
 
 ---
 

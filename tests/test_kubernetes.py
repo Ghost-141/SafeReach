@@ -18,6 +18,9 @@ ALLOWED = [
     "kubectl cluster-info",
     "kubectl api-resources",
     "kubectl config current-context",
+    # names only — the values are what `describe` would print, and that is denied
+    "kubectl get configmaps",
+    "kubectl get cm --namespace prod",
 ]
 
 #: Grouped by what each one would give away if it slipped through.
@@ -30,6 +33,15 @@ DENIED = [
     "kubectl get secrets.v1.core",
     "kubectl describe secret db-creds",
     "kubectl get serviceaccounts",
+    # abbreviations are the same request; the validator canonicalises before denying
+    "kubectl get sa",
+    "kubectl get sa/default",
+    "kubectl get serviceaccount default",
+    "kubectl describe sa default",
+    # describe prints ConfigMap values in full; get prints names
+    "kubectl describe configmap app-config",
+    "kubectl describe cm app-config",
+    "kubectl describe configmaps",
     # code execution / data movement
     "kubectl exec api-0 -- sh",
     "kubectl attach api-0",

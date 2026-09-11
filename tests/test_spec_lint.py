@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from safereach.validator import MUTATING_VERBS, Rejected, render, validate
+from safereach.validator import BUILTIN_DENY_PATHS, MUTATING_VERBS, Rejected, render, validate
 
 #: Imported, never redefined: the runtime check in validator.py and this linter must
 #: use the same set or they drift, which is precisely the bug that prompted this file.
@@ -196,3 +196,127 @@ def test_exemptions_carry_a_justification() -> None:
     """An exemption without a reason is a hole nobody will revisit."""
     for key, reason in {**DATA_POSITIONALS, **OUTPUT_FLAG_EXEMPTIONS}.items():
         assert len(reason) > 40, f"exemption {key!r} needs a real justification"
+
+
+# --------------------------------------------------------------------------------------
+# Invariants from the 0.1.x security review. Each names a capability that was removed;
+# the check is that nobody adds it back without deleting the test that says why not.
+# --------------------------------------------------------------------------------------
+
+
+def _paths(bspec: dict) -> dict[tuple[str, ...], dict]:
+    out = {}
+    for entry in bspec.get("subcommand_paths") or []:
+        if isinstance(entry, dict):
+            out[tuple(entry["path"])] = entry
+        else:
+            out[tuple(entry)] = {}
+    return out
+
+
+def test_docker_inspect_has_no_format_and_no_history(spec: dict) -> None:
+    """A Go template reaches Config.Env in text form, past the JSON mask."""
+    paths = _paths(spec["docker"])
+    for path, entry in paths.items():
+        if path[-1] == "inspect":
+            assert "--format" not in (entry.get("flags") or {}), f"docker {' '.join(path)}"
+    assert not any(path[-1] == "history" for path in paths), "docker history exposes ENV layers"
+    assert "history" in spec["docker"]["deny_subcommands"]
+
+
+def test_systemctl_cannot_print_unit_files_or_the_environment(spec: dict) -> None:
+    subs = set(spec["systemctl"]["subcommands"])
+    assert "cat" not in subs, "systemctl cat prints Environment= verbatim"
+    assert "show-environment" not in subs
+    # `show` is safe only narrowed, and the narrowing enum must not name the environment.
+    choices = set(spec["systemctl"]["flags"]["-p"]["value"]["choices"])
+    assert not choices & {"Environment", "EnvironmentFiles", "ExecStart", "ExecStartPre"}
+
+
+def test_ps_cannot_print_command_lines(spec: dict) -> None:
+    """Full-format flags and the args/cmd/command columns are where `-pPASSWORD` lives."""
+    flags = set(spec["ps"]["flags"])
+    assert not flags & {"-f", "-F", "-l", "-a", "-x", "-u", "-w", "-c"}
+    pattern = spec["ps"]["flags"]["-o"]["value"]["pattern"]
+    for column in ("args", "cmd", "command", "cmdline"):
+        assert f"|{column}|" not in f"|{pattern}|".replace("(?:", "|").replace(")", "|"), column
+
+
+def test_url_taking_binaries_never_follow_redirects(spec: dict) -> None:
+    for binary, bspec in spec.items():
+        positionals = bspec.get("positionals") or {}
+        if not positionals.get("host_allowlist_from"):
+            continue
+        denied = bspec.get("deny_flags") or {}
+        for flag in ("-L", "--location", "--location-trusted", "--max-redirs"):
+            assert flag in denied, f"{binary} {flag}"
+            assert flag not in (bspec.get("flags") or {}), f"{binary} {flag}"
+
+
+def test_exec_content_readers_take_prefixes_from_host_policy() -> None:
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shim"))
+    from shim_main import EXEC_INNER_SPEC
+
+    for binary in ("cat", "tail", "head"):
+        assert EXEC_INNER_SPEC[binary]["positionals"]["path_prefixes_from"] == "exec_path_prefixes"
+    assert (
+        EXEC_INNER_SPEC["grep"]["positionals"]["rest"]["path_prefixes_from"] == "exec_path_prefixes"
+    )
+
+
+#: The floor. A refactor may add to BUILTIN_DENY_PATHS; it may never drop one of these.
+DENY_FLOOR = {
+    "*.env",
+    "*.env.*",
+    ".env*",
+    "*/secrets/*",
+    "*.pem",
+    "*.key",
+    "id_rsa*",
+    "id_ed25519*",
+    "*/.ssh/*",
+    "*credentials*",
+    "*/.aws/*",
+    "*/.kube/config",
+    "/etc/shadow",
+    "/etc/sudoers*",
+    "/proc/*",
+    "/sys/*",
+    "*_history",
+    "/etc/safereach/*",
+    "/usr/local/bin/safereach-shim",
+}
+
+
+def test_builtin_deny_paths_never_shrink() -> None:
+    missing = DENY_FLOOR - set(BUILTIN_DENY_PATHS)
+    assert not missing, f"BUILTIN_DENY_PATHS lost: {sorted(missing)}"
+
+
+def test_no_path_prefix_reaches_the_policy_or_the_shim(spec: dict) -> None:
+    """The agent must never be able to read its own policy file or binary (Rule 3)."""
+    protected = ("/etc/safereach/config.json", "/usr/local/bin/safereach-shim")
+    for binary, bspec in spec.items():
+        groups = [bspec.get("positionals") or {}]
+        groups += [
+            (e.get("positionals") or {})
+            for e in bspec.get("subcommand_paths") or []
+            if isinstance(e, dict)
+        ]
+        for pspec in groups:
+            for rule in (pspec, pspec.get("rest") or {}, *(pspec.get("specs") or [])):
+                for prefix in rule.get("path_prefixes") or []:
+                    for target in protected:
+                        assert not target.startswith(prefix), f"{binary}: {prefix} reaches {target}"
+
+
+def test_describe_denies_a_superset_of_get(spec: dict) -> None:
+    """`describe` prints values; its deny list must include everything `get`'s does."""
+    base = set((spec["kubectl"]["positionals"] or {}).get("deny") or {})
+    describe = _paths(spec["kubectl"])[("describe",)]
+    ours = set((describe.get("positionals") or {}).get("deny") or {})
+    assert base <= ours, f"describe is missing {sorted(base - ours)}"
+    assert {"configmaps", "configmap"} <= ours

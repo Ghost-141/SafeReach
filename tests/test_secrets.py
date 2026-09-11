@@ -16,22 +16,11 @@ import json
 import pytest
 
 from safereach.redact import MASK, mask_env_keys
-from safereach.validator import Rejected, validate
+from safereach.validator import BUILTIN_DENY_PATHS, Rejected, validate
 
-DENY = [
-    "*.env",
-    "*.env.*",
-    ".env*",
-    "*.envrc",
-    "*/secrets/*",
-    "*/.ssh/*",
-    "*.pem",
-    "*.key",
-    "id_rsa*",
-    "id_ed25519*",
-    "*credentials*",
-    "*/.aws/*",
-]
+#: The compiled-in list, not a local copy: a test against a copy passes while the real
+#: list quietly loses an entry.
+DENY = list(BUILTIN_DENY_PATHS)
 
 
 @pytest.fixture
@@ -52,6 +41,16 @@ def dctx(ctx: dict) -> dict:
         "stat /etc/ssl/private/server.key",
         "ls /opt/app/secrets/db",
         "stat /home/deploy/.aws/credentials",
+        "stat /proc/1/environ",
+        "ls /proc/self/",
+        "ls /sys/kernel/",
+        "ls /etc/safereach/",
+        "stat /etc/safereach/config.json",
+        "stat /usr/local/bin/safereach-shim",
+        "ls /opt/app/config/database.yml",
+        "stat /opt/app/config/secrets.yml",
+        "stat /srv/site/.bash_history",
+        "stat /etc/shadow",
     ],
     ids=lambda c: c[:40],
 )

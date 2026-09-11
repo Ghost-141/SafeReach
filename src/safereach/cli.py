@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import __version__, naming
+from . import __version__, naming, shimbuild
 from .audit import AuditLog
 from .config import (
     DEFAULT_CONFIG_PATH,
@@ -38,9 +38,10 @@ from .config import (
     resolve_data_file,
 )
 from .console import console, status_mark, status_table
+from .discovery import scp_command, ssh_command
 from .install import adapters as ad
-from .ssh import SSHError, SSHPool
-from .validator import Rejected, render, validate
+from .ssh import SHELL_ANSWERED, SSHError, SSHPool, unrestricted_key_message
+from .validator import BUILTIN_DENY_PATHS, Rejected, render, validate
 from .versioning import fingerprint
 
 OK = "ok"
@@ -270,16 +271,24 @@ def cmd_discover(args: argparse.Namespace) -> int:
 #: refused in the container exactly as it is on the host.
 EXEC_INNER_ALLOW = ["cat", "tail", "head", "ls", "stat", "ps", "df", "grep"]
 
+#: Bare binary names, on purpose. The shim resolves them on its fixed PATH and sudo
+#: resolves them on secure_path; the sudoers entry written at enrolment carries the
+#: absolute path `command -v` found on THAT host, so /bin/dmesg and /usr/bin/dmesg
+#: hosts both match and the two files cannot disagree.
 ELEVATED_RECIPES: dict[str, list[str]] = {
-    "dmesg-recent": [
-        "/usr/bin/sudo",
-        "-n",
-        "/usr/bin/dmesg",
-        "--level=err,crit,alert,emerg",
-        "--ctime",
-    ],
-    "dmesg-all": ["/usr/bin/sudo", "-n", "/usr/bin/dmesg", "--ctime"],
+    "dmesg-recent": ["sudo", "-n", "dmesg", "--level=err,crit,alert,emerg", "--ctime"],
+    "dmesg-all": ["sudo", "-n", "dmesg", "--ctime"],
 }
+
+#: Pinned by digest, not tag. This container holds the Docker socket, which is root on
+#: the host; pulling `latest` onto a production box would be a standing supply-chain
+#: exposure on the one component that has that power. Bump deliberately.
+#: tecnativa/docker-socket-proxy v0.5.0, multi-arch manifest.
+DOCKER_PROXY_IMAGE = (
+    "tecnativa/docker-socket-proxy@sha256:"
+    "1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459"
+)
+DOCKER_PROXY_SOCKET = "/run/safereach/docker.sock"
 
 
 #: The default set written both into hosts.yaml and into each host's own policy file.
@@ -341,27 +350,10 @@ def _authorized_key_markers() -> list[str]:
     return markers
 
 
-#: Paths the agent may never name, in any command, on any host. Enforced against every
-#: argument token rather than only positionals — a path can arrive as a flag value too.
-DEFAULT_DENY_PATHS = [
-    "*.env",
-    "*.env.*",
-    ".env*",
-    "*.envrc",
-    "*/secrets/*",
-    "*/.ssh/*",
-    "*.pem",
-    "*.key",
-    "*.p12",
-    "*.pfx",
-    "id_rsa*",
-    "id_ed25519*",
-    "id_ecdsa*",
-    "*credentials*",
-    "*.kubeconfig",
-    "*/.aws/*",
-    "*/.docker/config.json",
-]
+#: The protected-path list is compiled into the shim (`validator.BUILTIN_DENY_PATHS`).
+#: It is written into the host policy as well only so an operator reading that file
+#: sees what is in force; the shim unions the two and can never end up with less.
+DEFAULT_DENY_PATHS = list(BUILTIN_DENY_PATHS)
 
 #: Where enrolment looks for .env files to learn variable names from.
 ENV_SCAN_ROOTS = ["/opt", "/srv", "/var/www", "/etc"]
@@ -382,8 +374,9 @@ done | sort -u | head -400
 ENV_VALUE_SCRIPT = r"""set -eu
 # Emits HMAC digests of secret VALUES — never a value itself. The hashing happens here,
 # as root on the host where the values already live, so the diag account ends up holding
-# hashes of secrets it cannot read.
-KEY="$1"
+# hashes of secrets it cannot read. The key is embedded here (hex, so no quoting) rather
+# than passed as an argument that sudo would write to the journal.
+KEY="{key}"
 for root in {roots}; do
     [ -d "$root" ] || continue
     find "$root" -maxdepth 4 -type f \( -name '.env' -o -name '.env.*' -o -name '*.env' \) 2>/dev/null
@@ -402,9 +395,11 @@ def _discover_env_digests(alias: str, key: str) -> list[str]:
     Requires `openssl`, which is present on any host running TLS. A host without it
     simply gets Layers 1 and 2 — the feature degrades rather than failing enrolment.
     """
+    # The key travels INSIDE the script on stdin, never as an argument: sudo logs its
+    # command line to the journal, which the diag account can read with journalctl.
     proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", alias, "sudo -n bash -s", "--", key],
-        input=ENV_VALUE_SCRIPT.format(roots=" ".join(ENV_SCAN_ROOTS)),
+        [*ssh_command(), "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
+        input=ENV_VALUE_SCRIPT.format(roots=" ".join(ENV_SCAN_ROOTS), key=key),
         capture_output=True,
         text=True,
         check=False,
@@ -423,7 +418,7 @@ def _discover_env_keys(alias: str) -> list[str]:
     and `systemctl show` output that the generic "looks like a password" patterns miss.
     """
     proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
+        [*ssh_command(), "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
         input=ENV_KEY_SCRIPT.format(roots=" ".join(ENV_SCAN_ROOTS)),
         capture_output=True,
         text=True,
@@ -464,11 +459,14 @@ getent group adm >/dev/null 2>&1 && usermod -aG adm "$DIAG_USER"
 # --- shim, owned by root ------------------------------------------------------------
 # In hardened mode the binary and its policy live outside the diag account entirely, so
 # the account cannot rewrite what it is allowed to run even if it were compromised.
-install -o root -g root -m 0755 /tmp/.safereach-shim.upload /usr/local/bin/safereach-shim
-rm -f /tmp/.safereach-shim.upload
+# The policy is readable by the diag GROUP only: it holds the HMAC key for the secret
+# digests, and a world-readable copy lets any local user brute-force weak values.
+UPLOAD_DIR="{upload_dir}"
+install -o root -g root -m 0755 "$UPLOAD_DIR/safereach-shim" /usr/local/bin/safereach-shim
 mkdir -p /etc/safereach
-install -o root -g root -m 0644 /tmp/.safereach-shim.conf.upload /etc/safereach/config.json
-rm -f /tmp/.safereach-shim.conf.upload
+chmod 0755 /etc/safereach
+install -o root -g "$DIAG_USER" -m 0640 "$UPLOAD_DIR/config.json" /etc/safereach/config.json
+rm -rf "$UPLOAD_DIR"
 
 # --- forced-command key -------------------------------------------------------------
 HOME_DIR=$(getent passwd "$DIAG_USER" | cut -d: -f6)
@@ -486,6 +484,8 @@ chmod 700 "$HOME_DIR/.ssh"; chmod 600 "$HOME_DIR/.ssh/authorized_keys"
 # --- sudoers: only the enabled recipes, exact match, no wildcards --------------------
 rm -f /etc/sudoers.d/safereach
 {sudoers_block}
+
+{sshd_match}
 
 # Audit log. The account whose commands are recorded must not be able to erase the
 # record, so the file is made append-only: with +a even its owner can only add to it,
@@ -507,21 +507,108 @@ echo "GROUPS=$(id -nG "$DIAG_USER")"
 echo "SHIM=$(/usr/local/bin/safereach-shim --version)"
 """
 
+#: A daemon-level copy of the authorized_keys restrictions, plus a session cap. Written
+#: as a drop-in so a mistake on the key line cannot re-enable forwarding or a TTY, and
+#: so a 32-host fan-out cannot open more channels than the host agreed to. Validated
+#: with `sshd -t` before it is kept, and only reloaded if the validation passes — a
+#: broken sshd config on a production host is worse than a missing hardening.
+SSHD_MATCH_SNIPPET = r"""# --- sshd: daemon-level restrictions for the diag account ---------------------------
+SSHD_MATCH="skipped"
+if [ -d /etc/ssh/sshd_config.d ] && grep -qsE '^\s*Include\s+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
+    cat > /etc/ssh/sshd_config.d/zz-safereach-diag.conf <<SSHDMATCH
+# Written by safereach enroll --hardened. Match blocks must come last; zz- sorts last.
+Match User $DIAG_USER
+    MaxSessions 4
+    AllowTcpForwarding no
+    AllowAgentForwarding no
+    PermitTTY no
+    X11Forwarding no
+    PasswordAuthentication no
+    PermitUserRc no
+SSHDMATCH
+    chmod 0644 /etc/ssh/sshd_config.d/zz-safereach-diag.conf
+    if sshd -t 2>/dev/null && sshd -T -C "user=$DIAG_USER" 2>/dev/null | grep -qi '^permittty no'; then
+        (systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null) && SSHD_MATCH="present" || SSHD_MATCH="written-not-reloaded"
+    else
+        rm -f /etc/ssh/sshd_config.d/zz-safereach-diag.conf
+        SSHD_MATCH="invalid-removed"
+    fi
+fi
+echo "SSHD_MATCH=$SSHD_MATCH"
+"""
+
 DOCKER_PROXY_SCRIPT = r"""set -eu
 # Read-only Docker API. The diag account is deliberately NOT in the docker group, so
 # this proxy is its only route to container data — and the proxy refuses every mutating
 # call at the API level, independent of our parser.
+#
+# It listens on a UNIX SOCKET readable by the diag group only, not on a TCP port. A port
+# on loopback is reachable by every local user and by curl; a socket with mode 0660 is
+# reachable by `docker` running as diag and by nothing else the agent can invoke
+# (`curl --unix-socket` is a denied flag, compiled into the shim).
 if ! command -v docker >/dev/null 2>&1; then echo "NO_DOCKER=1"; exit 0; fi
+DIAG_USER="{diag_user}"
+IMAGE="{image}"
+SOCK="{socket}"
+SOCK_DIR="$(dirname "$SOCK")"
+# The socket is group-owned by the diag account, so it has to exist first. Same
+# idempotent useradd the hardened script runs; whichever runs first creates it.
+id -u "$DIAG_USER" >/dev/null 2>&1 || useradd -r -m -s /bin/bash "$DIAG_USER"
+DIAG_GID="$(getent group "$DIAG_USER" | cut -d: -f3)"
+
 docker rm -f safereach-docker-proxy >/dev/null 2>&1 || true
-docker run -d --name safereach-docker-proxy --restart unless-stopped \
-    -p 127.0.0.1:{proxy_port}:2375 \
+docker pull -q "$IMAGE" >/dev/null 2>&1 || true
+
+MODE="tcp"
+mkdir -p "$SOCK_DIR" /etc/safereach
+chown root:"$DIAG_USER" "$SOCK_DIR"; chmod 0750 "$SOCK_DIR"
+# Recreate the socket directory after a reboot, with the same ownership.
+mkdir -p /etc/tmpfiles.d
+printf 'd %s 0750 root %s -\n' "$SOCK_DIR" "$DIAG_USER" > /etc/tmpfiles.d/safereach.conf
+
+# The image renders its haproxy.cfg from a template and takes the bind address from
+# BIND_CONFIG, so the socket needs no config surgery. haproxy creates the socket with
+# the mode and ownership given here before it serves anything.
+rm -f "$SOCK"
+if docker run -d --name safereach-docker-proxy --restart unless-stopped \
+    -e BIND_CONFIG="unix@$SOCK mode 660 uid 0 gid $DIAG_GID" \
     -e CONTAINERS=1 -e IMAGES=1 -e NETWORKS=1 -e VOLUMES=1 -e INFO=1 -e VERSION=1 \
     -e POST={post} -e EXEC={exec_flag} -e BUILD=0 -e COMMIT=0 -e CONFIGS=0 -e SECRETS=0 \
     -e SERVICES=0 -e SWARM=0 -e SYSTEM=0 -e TASKS=0 -e NODES=0 -e PLUGINS=0 \
     -v /var/run/docker.sock:/var/run/docker.sock:ro \
-    tecnativa/docker-socket-proxy >/dev/null
-sleep 2
-echo "PROXY=$(docker inspect -f '{{{{.State.Status}}}}' safereach-docker-proxy)"
+    -v "$SOCK_DIR":"$SOCK_DIR" \
+    "$IMAGE" >/dev/null 2>&1; then
+    sleep 2
+    # Verified before it is trusted: the socket exists with the intended mode and the
+    # daemon answers through it. Anything else is torn down and replaced by TCP.
+    if [ -S "$SOCK" ] && [ "$(stat -c %a "$SOCK")" = "660" ] \
+       && DOCKER_HOST="unix://$SOCK" docker version >/dev/null 2>&1; then
+        MODE="unix"
+    else
+        docker rm -f safereach-docker-proxy >/dev/null 2>&1 || true
+    fi
+fi
+
+if [ "$MODE" = "tcp" ]; then
+    docker run -d --name safereach-docker-proxy --restart unless-stopped \
+        -p 127.0.0.1:{proxy_port}:2375 \
+        -e CONTAINERS=1 -e IMAGES=1 -e NETWORKS=1 -e VOLUMES=1 -e INFO=1 -e VERSION=1 \
+        -e POST={post} -e EXEC={exec_flag} -e BUILD=0 -e COMMIT=0 -e CONFIGS=0 -e SECRETS=0 \
+        -e SERVICES=0 -e SWARM=0 -e SYSTEM=0 -e TASKS=0 -e NODES=0 -e PLUGINS=0 \
+        -v /var/run/docker.sock:/var/run/docker.sock:ro \
+        "$IMAGE" >/dev/null
+    sleep 2
+    # Second best: keep the port, but let only the diag account connect to it.
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -D OUTPUT -o lo -p tcp --dport {proxy_port} -m owner ! --uid-owner "$DIAG_USER" -j REJECT 2>/dev/null || true
+        iptables -I OUTPUT -o lo -p tcp --dport {proxy_port} -m owner ! --uid-owner "$DIAG_USER" -j REJECT 2>/dev/null \
+            && MODE="tcp-owner-filtered" || true
+    fi
+fi
+
+echo "PROXY_STATUS=$(docker inspect -f '{{{{.State.Status}}}}' safereach-docker-proxy 2>/dev/null || echo missing)"
+echo "PROXY_MODE=$MODE"
+if [ "$MODE" = "unix" ]; then echo "DOCKER_HOST=unix://$SOCK"; else echo "DOCKER_HOST=tcp://127.0.0.1:{proxy_port}"; fi
 """
 
 
@@ -531,10 +618,10 @@ chmod 700 "$HOME/.ssh"
 
 command -v python3 >/dev/null 2>&1 || {{ echo "python3 not found on this host" >&2; exit 1; }}
 
-install -m 0755 /tmp/.safereach-shim.upload "$HOME/.local/bin/safereach-shim"
-rm -f /tmp/.safereach-shim.upload
-install -m 0600 /tmp/.safereach-shim.conf.upload "$HOME/.config/safereach-shim/config.json"
-rm -f /tmp/.safereach-shim.conf.upload
+UPLOAD_DIR="{upload_dir}"
+install -m 0755 "$UPLOAD_DIR/safereach-shim" "$HOME/.local/bin/safereach-shim"
+install -m 0600 "$UPLOAD_DIR/config.json" "$HOME/.config/safereach-shim/config.json"
+rm -rf "$UPLOAD_DIR"
 
 touch "$HOME/.ssh/authorized_keys"
 # Replace only our own previous entry. Every other key in this file is left byte for
@@ -588,6 +675,40 @@ def _ensure_local_key() -> Path:
     return KEY_PATH
 
 
+def _remote_tmpdir(ssh_argv: list[str]) -> str | None:
+    """A fresh private directory on the host for this enrolment's uploads.
+
+    Fixed names under /tmp are a race and a symlink target for any other local user;
+    `mktemp -d` is neither. Returns the path, or None if the host could not make one.
+    """
+    proc = subprocess.run(
+        [*ssh_argv, "mktemp -d /tmp/safereach.XXXXXX"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    path = proc.stdout.strip()
+    if proc.returncode != 0 or not path.startswith("/tmp/safereach."):
+        return None
+    return path
+
+
+def _upload(
+    scp_argv: list[str], target: str, shim: Path, conf: Path, upload_dir: str
+) -> str | None:
+    """Copy the shim and policy into `upload_dir` on the host. Returns an error or None."""
+    for src, name in ((shim, "safereach-shim"), (conf, "config.json")):
+        up = subprocess.run(
+            [*scp_argv, str(src), f"{target}:{upload_dir}/{name}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if up.returncode != 0:
+            return up.stderr.strip()
+    return None
+
+
 def _enroll_one(
     alias: str,
     shim: Path,
@@ -610,7 +731,7 @@ def _enroll_one(
     # $HOME is not expanded inside command=, so the absolute path has to be resolved on
     # the host before the entry is written. One extra round trip, no guessing.
     probe = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", alias, "echo $HOME"],
+        [*ssh_command(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", alias, "echo $HOME"],
         capture_output=True,
         text=True,
         check=False,
@@ -642,25 +763,22 @@ def _enroll_one(
         conf_path = Path(fh.name)
 
     try:
-        for src, dest in (
-            (shim, "/tmp/.safereach-shim.upload"),
-            (conf_path, "/tmp/.safereach-shim.conf.upload"),
-        ):
-            up = subprocess.run(
-                ["scp", "-q", "-o", "BatchMode=yes", str(src), f"{alias}:{dest}"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if up.returncode != 0:
-                say(f"{BAD} {alias}: upload failed: {up.stderr.strip()}")
-                return None
+        upload_dir = _remote_tmpdir([*ssh_command(), "-o", "BatchMode=yes", alias])
+        if upload_dir is None:
+            say(f"{BAD} {alias}: could not create a temporary directory on the host")
+            return None
+        failure = _upload(
+            [*scp_command(), "-q", "-o", "BatchMode=yes"], alias, shim, conf_path, upload_dir
+        )
+        if failure:
+            say(f"{BAD} {alias}: upload failed: {failure}")
+            return None
 
         script = ENROLL_SCRIPT.format(
-            strip=_strip_markers_sh('"$HOME/.ssh/.ak.new"'), authkey=entry
+            strip=_strip_markers_sh('"$HOME/.ssh/.ak.new"'), authkey=entry, upload_dir=upload_dir
         )
         run = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", alias, "bash -s"],
+            [*ssh_command(), "-o", "BatchMode=yes", alias, "bash -s"],
             input=script,
             capture_output=True,
             text=True,
@@ -752,14 +870,26 @@ def _sudoers_block(elevated: list[str]) -> str:
     if not elevated:
         return 'echo "SUDOERS=none"'
     lines = []
+    binaries: list[str] = []
     for name in elevated:
         argv = ELEVATED_RECIPES[name]
-        # drop the leading sudo -n; sudoers describes what may be run *via* sudo
-        cmd = " ".join(a.replace(",", r"\,") for a in argv[2:])
+        # drop the leading sudo -n; sudoers describes what may be run *via* sudo. The
+        # binary is a placeholder resolved with `command -v` on the host below, because
+        # sudoers needs an absolute path and hosts disagree about where dmesg lives.
+        binary, rest = argv[2], argv[3:]
+        if binary not in binaries:
+            binaries.append(binary)
+        cmd = " ".join([f"{{BIN:{binary}}}", *(a.replace(",", r"\,") for a in rest)])
         lines.append(f"{{DIAG}} ALL=(root) NOPASSWD: {cmd}")
     body = "\n".join(lines)
+    resolve = "".join(
+        f'BIN_{i}="$(command -v {b} || true)"; [ -n "$BIN_{i}" ] || '
+        f'{{ echo "SUDOERS=missing-{b}"; exit 1; }}\n'
+        for i, b in enumerate(binaries)
+    )
+    subs = "".join(f' | sed "s|{{BIN:{b}}}|$BIN_{i}|"' for i, b in enumerate(binaries))
     return (
-        f'printf \'%s\\n\' "{body}" | sed "s/{{DIAG}}/$DIAG_USER/" '
+        resolve + f'printf \'%s\\n\' "{body}" | sed "s/{{DIAG}}/$DIAG_USER/"{subs} '
         "> /etc/sudoers.d/safereach\n"
         "chmod 0440 /etc/sudoers.d/safereach\n"
         "visudo -cf /etc/sudoers.d/safereach >/dev/null || "
@@ -778,6 +908,7 @@ def _enroll_hardened(
     settings: Settings | None,
     allow_exec: bool = False,
     exec_containers: list[str] | None = None,
+    exec_paths: list[str] | None = None,
 ) -> dict | None:
     """Create a dedicated unprivileged account and enrol against that, not your own.
 
@@ -799,21 +930,38 @@ def _enroll_hardened(
             "permits container create/start at the API level.\n"
             "        The command allowlist remains the control; the proxy no longer is."
         )
+    proxy_docker_host: str | None = None
     proxy = subprocess.run(
         # No -n here: the script itself is delivered on stdin.
-        ["ssh", "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
+        [*ssh_command(), "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
         input=DOCKER_PROXY_SCRIPT.format(
             proxy_port=proxy_port,
             post=1 if allow_exec else 0,
             exec_flag=1 if allow_exec else 0,
+            diag_user=diag_user,
+            image=DOCKER_PROXY_IMAGE,
+            socket=DOCKER_PROXY_SOCKET,
         ),
         capture_output=True,
         text=True,
         check=False,
     )
-    if "PROXY=running" in proxy.stdout:
+    proxy_info = dict(line.split("=", 1) for line in proxy.stdout.splitlines() if "=" in line)
+    if proxy_info.get("PROXY_STATUS") == "running":
         proxy_ok = True
-        say(f"   {alias}: read-only docker proxy on 127.0.0.1:{proxy_port}")
+        proxy_docker_host = proxy_info.get("DOCKER_HOST")
+        mode = proxy_info.get("PROXY_MODE", "?")
+        if mode == "unix":
+            say(f"   {alias}: read-only docker proxy on {DOCKER_PROXY_SOCKET} (diag group only)")
+        elif mode == "tcp-owner-filtered":
+            say(
+                f"   {alias}: docker proxy on 127.0.0.1:{proxy_port}, iptables-limited to {diag_user}"
+            )
+        else:
+            say(
+                f"{WARN} {alias}: docker proxy on 127.0.0.1:{proxy_port} reachable by every "
+                "local user (unix socket bind failed, no iptables); the shim still refuses curl to it"
+            )
     elif "NO_DOCKER=1" in proxy.stdout:
         say(f"   {alias}: no docker installed, skipping proxy")
     else:
@@ -840,8 +988,9 @@ def _enroll_hardened(
         "secret_digests": digests,
         "allow_exec": bool(allow_exec),
         "exec_containers": list(exec_containers or []),
+        "exec_path_prefixes": [p if p.endswith("/") else p + "/" for p in (exec_paths or [])],
         "exec_allow": sorted(EXEC_INNER_ALLOW),
-        "docker_host": f"tcp://127.0.0.1:{proxy_port}" if proxy_ok else None,
+        "docker_host": proxy_docker_host if proxy_ok else None,
         "env_allowlist": sorted(host_cfg.env_allowlist) if host_cfg else [],
         "command_timeout": 30,
         "max_output_bytes": 65536,
@@ -852,19 +1001,16 @@ def _enroll_hardened(
         fh.write(json.dumps(conf, indent=2))
         conf_path = Path(fh.name)
     try:
-        for src, dest in (
-            (shim, "/tmp/.safereach-shim.upload"),
-            (conf_path, "/tmp/.safereach-shim.conf.upload"),
-        ):
-            up = subprocess.run(
-                ["scp", "-q", "-o", "BatchMode=yes", str(src), f"{alias}:{dest}"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if up.returncode != 0:
-                say(f"{BAD} {alias}: upload failed: {up.stderr.strip()}")
-                return None
+        upload_dir = _remote_tmpdir([*ssh_command(), "-o", "BatchMode=yes", alias])
+        if upload_dir is None:
+            say(f"{BAD} {alias}: could not create a temporary directory on the host")
+            return None
+        failure = _upload(
+            [*scp_command(), "-q", "-o", "BatchMode=yes"], alias, shim, conf_path, upload_dir
+        )
+        if failure:
+            say(f"{BAD} {alias}: upload failed: {failure}")
+            return None
 
         authkey = (
             'command="/usr/local/bin/safereach-shim",no-pty,no-port-forwarding,'
@@ -875,10 +1021,12 @@ def _enroll_hardened(
             strip=_strip_markers_sh('"$HOME_DIR/.ssh/.ak.new"'),
             authkey=authkey,
             sudoers_block=_sudoers_block(elevated),
+            sshd_match=SSHD_MATCH_SNIPPET,
+            upload_dir=upload_dir,
         )
         run = subprocess.run(
             # No -n here: the script itself is delivered on stdin.
-            ["ssh", "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
+            [*ssh_command(), "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
             input=script,
             capture_output=True,
             text=True,
@@ -931,7 +1079,8 @@ def _enroll_hardened(
 
     say(
         f"{OK} {alias}: user {diag_user}, groups [{info.get('GROUPS', '?')}], "
-        f"sudoers {info.get('SUDOERS', '?')}, shim {info.get('SHIM')}"
+        f"sudoers {info.get('SUDOERS', '?')}, sshd match {info.get('SSHD_MATCH', '?')}, "
+        f"audit {info.get('AUDIT', '?')}, shim {info.get('SHIM')}"
     )
     return {
         "alias": alias,
@@ -1014,6 +1163,18 @@ def cmd_enroll(args: argparse.Namespace) -> int:
         say(f"{BAD} name a host, or pass --all to enroll every reachable host")
         return 2
 
+    if args.allow_exec:
+        # Default-deny on both axes. "Any container, any path" is not a policy.
+        if not args.hardened:
+            say(f"{BAD} --allow-exec requires --hardened")
+            return 2
+        if not args.exec_container:
+            say(f"{BAD} --allow-exec needs at least one --exec-container NAME")
+            return 2
+        if not args.exec_path or not all(p.startswith("/") for p in args.exec_path):
+            say(f"{BAD} --allow-exec needs at least one absolute --exec-path PREFIX")
+            return 2
+
     chosen_names = _resolve_enroll_names(aliases, args)
 
     if args.hardened:
@@ -1048,6 +1209,7 @@ def cmd_enroll(args: argparse.Namespace) -> int:
                     settings,
                     args.allow_exec,
                     args.exec_container,
+                    args.exec_path,
                 )
             )
         ]
@@ -1316,10 +1478,14 @@ async def _probe_hosts(
 
         async def one(host: HostConfig) -> tuple[str, str, str]:
             try:
-                version = await pool.shim_version(host)
+                version, code = await pool.shim_probe(host)
             except SSHError as exc:
                 return (BAD, host.alias, str(exc))
             if version is None:
+                if code == SHELL_ANSWERED and host.shim_required(settings.defaults):
+                    return (BAD, host.alias, unrestricted_key_message(host.alias))
+                if code == SHELL_ANSWERED:
+                    return (WARN, host.alias, "client-only: no shim, this key has a shell")
                 return (WARN, host.alias, f"reachable, no shim — run `enroll {host.alias}`")
             if version != expected:
                 # Drift is the realistic failure mode, and since enrolment needs no root
@@ -1349,8 +1515,18 @@ def _push_shim(alias: str) -> bool:
         shim, _expected = _build_shim()
     except RuntimeError:
         return False
+    upload_dir = _remote_tmpdir([*ssh_command(), "-o", "BatchMode=yes", alias])
+    if upload_dir is None:
+        return False
     up = subprocess.run(
-        ["scp", "-q", "-o", "BatchMode=yes", str(shim), f"{alias}:/tmp/.safereach-shim.upload"],
+        [
+            *scp_command(),
+            "-q",
+            "-o",
+            "BatchMode=yes",
+            str(shim),
+            f"{alias}:{upload_dir}/safereach-shim",
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -1359,12 +1535,12 @@ def _push_shim(alias: str) -> bool:
         return False
     inst = subprocess.run(
         [
-            "ssh",
+            *ssh_command(),
             "-o",
             "BatchMode=yes",
             alias,
-            'install -m 0755 /tmp/.safereach-shim.upload "$HOME/.local/bin/safereach-shim" '
-            "&& rm -f /tmp/.safereach-shim.upload",
+            f'install -m 0755 "{upload_dir}/safereach-shim" "$HOME/.local/bin/safereach-shim" '
+            f'&& rm -rf "{upload_dir}"',
         ],
         capture_output=True,
         text=True,
@@ -1475,11 +1651,19 @@ for grp in systemd-journal adm; do
   fi
 done
 
-install -m 0755 /tmp/safereach-shim.upload "$SHIM"
-rm -f /tmp/safereach-shim.upload
+UPLOAD_DIR="{upload_dir}"
+install -o root -g root -m 0755 "$UPLOAD_DIR/safereach-shim" "$SHIM"
 mkdir -p "$CONF_DIR"
-install -m 0644 /tmp/safereach-shim.conf.upload "$CONF_DIR/config.json"
-rm -f /tmp/safereach-shim.conf.upload
+chmod 0755 "$CONF_DIR"
+# Group-readable only: the policy holds the HMAC key for the secret digests.
+install -o root -g "$DIAG_USER" -m 0640 "$UPLOAD_DIR/config.json" "$CONF_DIR/config.json"
+rm -rf "$UPLOAD_DIR"
+
+# --- sudoers: only the enabled recipes, exact match, no wildcards --------------------
+rm -f /etc/sudoers.d/safereach
+{sudoers_block}
+
+{sshd_match}
 
 HOME_DIR=$(getent passwd "$DIAG_USER" | cut -d: -f6)
 mkdir -p "$HOME_DIR/.ssh"
@@ -1509,27 +1693,38 @@ AUTHKEY_OPTS = (
 
 
 def _build_shim() -> tuple[Path, str]:
-    """Build the shim into a temp file and return its path and fingerprint."""
-    repo_build = Path(__file__).resolve().parents[2] / "shim" / "build.py"
-    spec = load_command_spec()
-    expected = fingerprint(spec)
+    """Build the shim into a temp file and return its path and fingerprint.
 
-    if repo_build.is_file():
-        out = Path(tempfile.mkdtemp(prefix="safereach-shim-")) / "safereach-shim"
-        proc = subprocess.run(
-            [sys.executable, str(repo_build), "--out", str(out)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(f"shim build failed: {proc.stderr.strip()}")
-        return out, expected
+    Built from the installed package's own sources, never from a repo checkout or a
+    pre-built artifact: 0.1.0 and 0.1.1 shipped without either, so every enrolment from a
+    `uvx` install failed. Assembling it here means the wheel that runs the server is the
+    wheel that produces the shim, and the two fingerprints cannot disagree.
+    """
+    out = Path(tempfile.mkdtemp(prefix="safereach-shim-")) / "safereach-shim"
+    try:
+        version = shimbuild.write(out)
+    except (RuntimeError, SyntaxError, FileNotFoundError) as exc:
+        raise RuntimeError(f"shim build failed: {exc}") from exc
+    return out, version
 
-    packaged = Path(__file__).parent / "data" / "safereach-shim"
-    if packaged.is_file():
-        return packaged, expected
-    raise RuntimeError("cannot locate shim/build.py or a packaged safereach-shim")
+
+def cmd_shim_build(args: argparse.Namespace) -> int:
+    """Write the shim to a file without deploying it.
+
+    For hosts configured by hand or by configuration management, and for the release
+    smoke test that proves the published wheel can still produce a working shim.
+    """
+    try:
+        if args.print_version:
+            print(shimbuild.build()[1])
+            return 0
+        out = Path(args.out).expanduser()
+        version = shimbuild.write(out)
+    except (RuntimeError, SyntaxError, FileNotFoundError) as exc:
+        say(f"{BAD} shim build failed: {exc}")
+        return 1
+    say(f"{OK} wrote {out} (fingerprint {version})")
+    return 0
 
 
 def _shim_config(host: HostConfig, settings: Settings) -> dict[str, Any]:
@@ -1546,22 +1741,14 @@ def _shim_config(host: HostConfig, settings: Settings) -> dict[str, Any]:
         "command_timeout": host.timeout(settings.defaults),
         "max_output_bytes": host.max_bytes(settings.defaults),
         "elevated": {
-            "dmesg-recent": [
-                "/usr/bin/sudo",
-                "-n",
-                "/bin/dmesg",
-                "--level=err,crit,alert,emerg",
-                "--ctime",
-            ]
-        }
-        if "dmesg-recent" in host.elevated
-        else {},
+            name: ELEVATED_RECIPES[name] for name in host.elevated if name in ELEVATED_RECIPES
+        },
     }
 
 
 def _ssh_base(args: argparse.Namespace, host: HostConfig, settings: Settings) -> list[str]:
     port = host.ssh_port(settings.defaults)
-    return ["ssh", "-p", str(port), f"{args.admin_user}@{host.hostname}"]
+    return [*ssh_command(), "-p", str(port), f"{args.admin_user}@{host.hostname}"]
 
 
 def cmd_provision(args: argparse.Namespace) -> int:
@@ -1578,14 +1765,26 @@ def cmd_provision(args: argparse.Namespace) -> int:
         return 1
 
     authkey = f"{AUTHKEY_OPTS} {pub.read_text(encoding='utf-8').strip()}"
-    script = REMOTE_SETUP.format(user=host.user, authkey=authkey)
+
+    def render_script(upload_dir: str) -> str:
+        return REMOTE_SETUP.format(
+            user=host.user,
+            authkey=authkey,
+            upload_dir=upload_dir,
+            sudoers_block=_sudoers_block(sorted(host.elevated)),
+            sshd_match=SSHD_MATCH_SNIPPET,
+        )
+
+    script = render_script("/tmp/safereach.XXXXXX")
     conf = json.dumps(_shim_config(host, settings), indent=2)
 
     say(f"About to provision {host.alias} ({host.hostname}) as admin user {args.admin_user!r}:")
     say(f"  - create unprivileged user {host.user!r}, add to systemd-journal and adm")
     say("  - install /usr/local/bin/safereach-shim")
-    say("  - write /etc/safereach/config.json")
+    say("  - write /etc/safereach/config.json (root:diag 0640)")
     say("  - pin the diag key to a forced command in authorized_keys")
+    say("  - write an exact-match sudoers entry for enabled recipes only")
+    say("  - add an sshd Match block for the diag user (validated before reload)")
     say("")
     if args.dry_run:
         say("--- remote script ---")
@@ -1611,23 +1810,18 @@ def cmd_provision(args: argparse.Namespace) -> int:
         conf_path = Path(fh.name)
 
     try:
-        for src, dest in (
-            (shim_path, "/tmp/safereach-shim.upload"),
-            (conf_path, "/tmp/safereach-shim.conf.upload"),
-        ):
-            proc = subprocess.run(
-                ["scp", "-P", port, str(src), f"{target}:{dest}"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if proc.returncode != 0:
-                say(f"{BAD} scp failed: {proc.stderr.strip()}")
-                return 1
+        upload_dir = _remote_tmpdir(_ssh_base(args, host, settings))
+        if upload_dir is None:
+            say(f"{BAD} could not create a temporary directory on the host")
+            return 1
+        failure = _upload([*scp_command(), "-P", port], target, shim_path, conf_path, upload_dir)
+        if failure:
+            say(f"{BAD} scp failed: {failure}")
+            return 1
 
         proc = subprocess.run(
             [*_ssh_base(args, host, settings), "sudo", "-n", "bash", "-s"],
-            input=script,
+            input=render_script(upload_dir),
             capture_output=True,
             text=True,
             check=False,
@@ -1669,8 +1863,13 @@ def cmd_shim_update(args: argparse.Namespace) -> int:
     for host in hosts:
         port = str(host.ssh_port(settings.defaults))
         target = f"{args.admin_user}@{host.hostname}"
+        upload_dir = _remote_tmpdir([*ssh_command(), "-p", port, target])
+        if upload_dir is None:
+            say(f"{BAD} {host.alias}: could not create a temporary directory on the host")
+            failures += 1
+            continue
         up = subprocess.run(
-            ["scp", "-P", port, str(shim_path), f"{target}:/tmp/safereach-shim.upload"],
+            [*scp_command(), "-P", port, str(shim_path), f"{target}:{upload_dir}/safereach-shim"],
             capture_output=True,
             text=True,
             check=False,
@@ -1681,17 +1880,12 @@ def cmd_shim_update(args: argparse.Namespace) -> int:
             continue
         inst = subprocess.run(
             [
-                "ssh",
+                *ssh_command(),
                 "-p",
                 port,
                 target,
-                "sudo",
-                "-n",
-                "install",
-                "-m",
-                "0755",
-                "/tmp/safereach-shim.upload",
-                "/usr/local/bin/safereach-shim",
+                f'sudo -n install -o root -g root -m 0755 "{upload_dir}/safereach-shim" '
+                f'/usr/local/bin/safereach-shim && rm -rf "{upload_dir}"',
             ],
             capture_output=True,
             text=True,
@@ -1726,6 +1920,7 @@ setting up servers
   provision                     create a dedicated unprivileged account on a host
   rename                        give a host a friendlier name (local, no re-enrol)
   shim-update                   redeploy the remote validator after a spec change
+  shim-build                    write the remote validator to a file, no deploy
 
 connecting agents
   install                       register this server with your AI agents
@@ -1757,6 +1952,7 @@ SUBCOMMAND_DESCRIPTIONS = {
     "doctor": "Verify config, key permissions, host reachability, and whether each host's\nremote validator matches this version.\n\nThe first thing to run when an agent reports something odd.",
     "provision": "Create a dedicated unprivileged account on a host, using your admin access.\n\nStronger than plain `enroll`: the account has no sudo and is not in the docker\ngroup, so it is a second barrier behind the command allowlist.",
     "shim-update": "Rebuild the remote validator and redeploy it.\n\nRun after changing config/commands.yaml. Hosts running an older copy are\nrefused rather than silently allowed to use a stale allowlist.",
+    "shim-build": "Write the remote validator (safereach-shim) to a file without deploying it.\n\nFor hosts you configure by hand or through configuration management, and\nfor checking that this install can produce a shim at all. The fingerprint\nprinted is the one the server will expect every host to report.",
 }
 
 
@@ -1769,6 +1965,7 @@ COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
             ("provision", "create a dedicated unprivileged account on a host"),
             ("rename", "give a host a friendlier name (local, no re-enrol)"),
             ("shim-update", "redeploy the remote validator after a spec change"),
+            ("shim-build", "write the remote validator to a file, no deploy"),
         ],
     ),
     (
@@ -1937,7 +2134,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="NAME",
-        help="restrict --allow-exec to this container (repeatable; default: any)",
+        help="container --allow-exec may reach (repeatable; required with --allow-exec)",
+    )
+    p.add_argument(
+        "--exec-path",
+        action="append",
+        default=[],
+        metavar="PREFIX",
+        help="directory prefix cat/tail/head/grep may read inside a container, e.g. "
+        "/app/storage/logs/ (repeatable; required with --allow-exec)",
     )
     p.set_defaults(func=cmd_enroll)
 
@@ -1991,6 +2196,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true")
     p.add_argument("--admin-user", default=os.environ.get("USER", "root"))
     p.set_defaults(func=cmd_shim_update)
+
+    p = sub.add_parser("shim-build", help="write the shim to a file without deploying it")
+    p.add_argument("--out", default="./safereach-shim", help="destination path")
+    p.add_argument(
+        "--print-version", action="store_true", help="print the fingerprint only, build nothing"
+    )
+    p.set_defaults(func=cmd_shim_build)
 
     _describe_subcommands(sub)
     return parser

@@ -1,0 +1,12 @@
+[Unit]
+Description=e2e app (carries secrets on purpose)
+After=network.target
+
+[Service]
+Environment=STRIPE_KEY=UNITFILESECRET-e2e-1234567890
+Environment=APP_ENV=production
+ExecStart=/usr/bin/python3 /opt/app/app.py --password CMDLINESECRET99 --port 8080
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

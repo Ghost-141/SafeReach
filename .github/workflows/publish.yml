@@ -76,6 +76,7 @@ jobs:
     needs: decide
     if: needs.decide.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -94,6 +95,25 @@ jobs:
       - name: Format
         run: uv run ruff format --check .
 
+      # The release gate that matters: this exact tree, enrolled onto a real host as
+      # root, with the review's probes replayed against the real shim. Nothing reaches
+      # PyPI that has not passed it in the same run.
+      # The image is identical on every push; rebuilding it was 90% of the job's time.
+      # Buildx with the Actions cache turns a 7-minute build into a cache hit.
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the disposable host image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: tests/e2e
+          tags: safereach-e2e-host:latest
+          load: true
+          cache-from: type=gha,scope=e2e-host
+          cache-to: type=gha,scope=e2e-host,mode=max
+      - name: End-to-end suite against a real host
+        env:
+          SAFEREACH_E2E: "1"
+        run: uv run pytest tests/e2e -v
+
       - name: Build sdist and wheel
         run: uv build
 
@@ -101,13 +121,20 @@ jobs:
         run: uv run --with twine twine check dist/*
 
       # A wheel that imports but cannot find its packaged commands.yaml is useless, and
-      # that only fails outside the source tree.
+      # that only fails outside the source tree. The same goes for the shim: 0.1.0 and
+      # 0.1.1 passed a smoke test like this and still could not enrol a single host,
+      # because nothing here asked the installed package to build one.
       - name: Smoke-test the wheel in a clean environment
         run: |
           uv venv /tmp/verify
           uv pip install --python /tmp/verify/bin/python dist/*.whl
           /tmp/verify/bin/safereach --version
           /tmp/verify/bin/safereach validate "journalctl -u nginx -n 5"
+          /tmp/verify/bin/safereach shim-build --out /tmp/verify/safereach-shim
+          REPORTED=$(python3 /tmp/verify/safereach-shim --version)
+          EXPECTED=$(/tmp/verify/bin/safereach shim-build --print-version)
+          echo "shim fingerprint: $REPORTED (server expects $EXPECTED)"
+          [ "$REPORTED" = "$EXPECTED" ] || { echo "shim fingerprint mismatch"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:
