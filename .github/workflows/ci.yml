@@ -1,7 +1,9 @@
 name: CI
 
-# Every push to any branch, plus pull requests. A PR from a branch in this repo has
-# already run on its push, so the jobs skip that duplicate; a PR from a fork has not.
+# Every push to any branch, plus pull requests. A PR from a branch in this repo runs
+# twice (once for the push, once for the PR). That duplicate is cheap — the host image
+# is cached — and the alternative, skipping the PR run's jobs, makes the required
+# `ci-ok` check fail on every PR: a skipped `needs` job is not a success.
 on:
   push:
   pull_request:
@@ -13,7 +15,6 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     strategy:
       matrix:
         python: ["3.11", "3.12", "3.13"]
@@ -38,7 +39,6 @@ jobs:
   # probes against the real shim. It runs on every push, and ci-ok requires it.
   e2e:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
