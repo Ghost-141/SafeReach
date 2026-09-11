@@ -2,7 +2,8 @@
 build/
 .coverage
 dist/
-docs/
+# Private working notes and plans. Never published; docs/ is the public folder.
+plan/
 *.egg-info/
 hosts.yaml
 htmlcov/
