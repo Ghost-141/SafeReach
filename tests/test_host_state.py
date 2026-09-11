@@ -149,7 +149,8 @@ def test_docker_proxy_is_pinned_by_digest_and_prefers_a_unix_socket() -> None:
     )
     assert "@sha256:" in DOCKER_PROXY_IMAGE and ":latest" not in DOCKER_PROXY_IMAGE
     assert "tecnativa/docker-socket-proxy >/dev/null" not in script  # no unpinned pull
-    assert "bind unix@$SOCK mode 660 uid 0 gid $DIAG_GID" in script
+    assert 'BIND_CONFIG="unix@$SOCK mode 660 uid 0 gid $DIAG_GID"' in script
+    assert '[ "$(stat -c %a "$SOCK")" = "660" ]' in script  # mode verified, not assumed
     assert 'DOCKER_HOST="unix://$SOCK" docker version' in script  # verified before use
     assert "printf 'd %s 0750 root %s -\\n'" in script  # survives reboot
     # the TCP fallback is still owner-filtered where iptables exists
@@ -161,3 +162,21 @@ def test_hardened_script_reports_what_it_did() -> None:
     script = _hardened()
     for marker in ("SUDOERS=", "SSHD_MATCH=", "AUDIT=", "SHIM=", "GROUPS="):
         assert marker in script
+
+
+def test_ssh_config_override_reaches_every_ssh_and_scp_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenSSH reads ~/.ssh/config from the passwd home, not $HOME, so a config kept
+    elsewhere (or a test rig's) has to be passed explicitly — to all of them."""
+    from safereach.discovery import scp_command, ssh_command
+
+    monkeypatch.delenv("SAFEREACH_SSH_CONFIG", raising=False)
+    assert ssh_command("-G", "h") == ["ssh", "-G", "h"]
+    monkeypatch.setenv("SAFEREACH_SSH_CONFIG", "/x/config")
+    assert ssh_command("-G", "h") == ["ssh", "-F", "/x/config", "-G", "h"]
+    assert scp_command("-q") == ["scp", "-F", "/x/config", "-q"]
+    # nothing in the CLI builds an ssh/scp argv without going through these
+    source = (Path(cli.__file__)).read_text(encoding="utf-8")
+    assert '["ssh", ' not in source and '["scp", ' not in source
+    assert source.count('"-F",\n                "/dev/null"') == 2  # the two enrolled-key probes

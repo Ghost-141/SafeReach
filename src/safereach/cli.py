@@ -38,6 +38,7 @@ from .config import (
     resolve_data_file,
 )
 from .console import console, status_mark, status_table
+from .discovery import scp_command, ssh_command
 from .install import adapters as ad
 from .ssh import SHELL_ANSWERED, SSHError, SSHPool, unrestricted_key_message
 from .validator import BUILTIN_DENY_PATHS, Rejected, render, validate
@@ -397,7 +398,7 @@ def _discover_env_digests(alias: str, key: str) -> list[str]:
     # The key travels INSIDE the script on stdin, never as an argument: sudo logs its
     # command line to the journal, which the diag account can read with journalctl.
     proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
+        [*ssh_command(), "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
         input=ENV_VALUE_SCRIPT.format(roots=" ".join(ENV_SCAN_ROOTS), key=key),
         capture_output=True,
         text=True,
@@ -417,7 +418,7 @@ def _discover_env_keys(alias: str) -> list[str]:
     and `systemctl show` output that the generic "looks like a password" patterns miss.
     """
     proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
+        [*ssh_command(), "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
         input=ENV_KEY_SCRIPT.format(roots=" ".join(ENV_SCAN_ROOTS)),
         capture_output=True,
         text=True,
@@ -565,27 +566,26 @@ chown root:"$DIAG_USER" "$SOCK_DIR"; chmod 0750 "$SOCK_DIR"
 mkdir -p /etc/tmpfiles.d
 printf 'd %s 0750 root %s -\n' "$SOCK_DIR" "$DIAG_USER" > /etc/tmpfiles.d/safereach.conf
 
-# The image's own haproxy.cfg with only the bind line changed. If the file is not where
-# this version of the image keeps it, fall back to TCP rather than guess at a config.
-if docker run --rm --entrypoint cat "$IMAGE" /usr/local/etc/haproxy/haproxy.cfg > /etc/safereach/haproxy.cfg 2>/dev/null \
-   && grep -qE '^\s*bind\s+:2375' /etc/safereach/haproxy.cfg; then
-    sed -i -E "s|^(\s*)bind\s+:2375.*|\1bind unix@$SOCK mode 660 uid 0 gid $DIAG_GID|" /etc/safereach/haproxy.cfg
-    chmod 0644 /etc/safereach/haproxy.cfg
-    rm -f "$SOCK"
-    if docker run -d --name safereach-docker-proxy --restart unless-stopped \
-        -e CONTAINERS=1 -e IMAGES=1 -e NETWORKS=1 -e VOLUMES=1 -e INFO=1 -e VERSION=1 \
-        -e POST={post} -e EXEC={exec_flag} -e BUILD=0 -e COMMIT=0 -e CONFIGS=0 -e SECRETS=0 \
-        -e SERVICES=0 -e SWARM=0 -e SYSTEM=0 -e TASKS=0 -e NODES=0 -e PLUGINS=0 \
-        -v /var/run/docker.sock:/var/run/docker.sock:ro \
-        -v "$SOCK_DIR":"$SOCK_DIR" \
-        -v /etc/safereach/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro \
-        "$IMAGE" >/dev/null 2>&1; then
-        sleep 2
-        if [ -S "$SOCK" ] && DOCKER_HOST="unix://$SOCK" docker version >/dev/null 2>&1; then
-            MODE="unix"
-        else
-            docker rm -f safereach-docker-proxy >/dev/null 2>&1 || true
-        fi
+# The image renders its haproxy.cfg from a template and takes the bind address from
+# BIND_CONFIG, so the socket needs no config surgery. haproxy creates the socket with
+# the mode and ownership given here before it serves anything.
+rm -f "$SOCK"
+if docker run -d --name safereach-docker-proxy --restart unless-stopped \
+    -e BIND_CONFIG="unix@$SOCK mode 660 uid 0 gid $DIAG_GID" \
+    -e CONTAINERS=1 -e IMAGES=1 -e NETWORKS=1 -e VOLUMES=1 -e INFO=1 -e VERSION=1 \
+    -e POST={post} -e EXEC={exec_flag} -e BUILD=0 -e COMMIT=0 -e CONFIGS=0 -e SECRETS=0 \
+    -e SERVICES=0 -e SWARM=0 -e SYSTEM=0 -e TASKS=0 -e NODES=0 -e PLUGINS=0 \
+    -v /var/run/docker.sock:/var/run/docker.sock:ro \
+    -v "$SOCK_DIR":"$SOCK_DIR" \
+    "$IMAGE" >/dev/null 2>&1; then
+    sleep 2
+    # Verified before it is trusted: the socket exists with the intended mode and the
+    # daemon answers through it. Anything else is torn down and replaced by TCP.
+    if [ -S "$SOCK" ] && [ "$(stat -c %a "$SOCK")" = "660" ] \
+       && DOCKER_HOST="unix://$SOCK" docker version >/dev/null 2>&1; then
+        MODE="unix"
+    else
+        docker rm -f safereach-docker-proxy >/dev/null 2>&1 || true
     fi
 fi
 
@@ -731,7 +731,7 @@ def _enroll_one(
     # $HOME is not expanded inside command=, so the absolute path has to be resolved on
     # the host before the entry is written. One extra round trip, no guessing.
     probe = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", alias, "echo $HOME"],
+        [*ssh_command(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", alias, "echo $HOME"],
         capture_output=True,
         text=True,
         check=False,
@@ -763,11 +763,13 @@ def _enroll_one(
         conf_path = Path(fh.name)
 
     try:
-        upload_dir = _remote_tmpdir(["ssh", "-o", "BatchMode=yes", alias])
+        upload_dir = _remote_tmpdir([*ssh_command(), "-o", "BatchMode=yes", alias])
         if upload_dir is None:
             say(f"{BAD} {alias}: could not create a temporary directory on the host")
             return None
-        failure = _upload(["scp", "-q", "-o", "BatchMode=yes"], alias, shim, conf_path, upload_dir)
+        failure = _upload(
+            [*scp_command(), "-q", "-o", "BatchMode=yes"], alias, shim, conf_path, upload_dir
+        )
         if failure:
             say(f"{BAD} {alias}: upload failed: {failure}")
             return None
@@ -776,7 +778,7 @@ def _enroll_one(
             strip=_strip_markers_sh('"$HOME/.ssh/.ak.new"'), authkey=entry, upload_dir=upload_dir
         )
         run = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", alias, "bash -s"],
+            [*ssh_command(), "-o", "BatchMode=yes", alias, "bash -s"],
             input=script,
             capture_output=True,
             text=True,
@@ -931,7 +933,7 @@ def _enroll_hardened(
     proxy_docker_host: str | None = None
     proxy = subprocess.run(
         # No -n here: the script itself is delivered on stdin.
-        ["ssh", "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
+        [*ssh_command(), "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
         input=DOCKER_PROXY_SCRIPT.format(
             proxy_port=proxy_port,
             post=1 if allow_exec else 0,
@@ -999,11 +1001,13 @@ def _enroll_hardened(
         fh.write(json.dumps(conf, indent=2))
         conf_path = Path(fh.name)
     try:
-        upload_dir = _remote_tmpdir(["ssh", "-o", "BatchMode=yes", alias])
+        upload_dir = _remote_tmpdir([*ssh_command(), "-o", "BatchMode=yes", alias])
         if upload_dir is None:
             say(f"{BAD} {alias}: could not create a temporary directory on the host")
             return None
-        failure = _upload(["scp", "-q", "-o", "BatchMode=yes"], alias, shim, conf_path, upload_dir)
+        failure = _upload(
+            [*scp_command(), "-q", "-o", "BatchMode=yes"], alias, shim, conf_path, upload_dir
+        )
         if failure:
             say(f"{BAD} {alias}: upload failed: {failure}")
             return None
@@ -1022,7 +1026,7 @@ def _enroll_hardened(
         )
         run = subprocess.run(
             # No -n here: the script itself is delivered on stdin.
-            ["ssh", "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
+            [*ssh_command(), "-o", "BatchMode=yes", alias, "sudo -n bash -s"],
             input=script,
             capture_output=True,
             text=True,
@@ -1511,11 +1515,18 @@ def _push_shim(alias: str) -> bool:
         shim, _expected = _build_shim()
     except RuntimeError:
         return False
-    upload_dir = _remote_tmpdir(["ssh", "-o", "BatchMode=yes", alias])
+    upload_dir = _remote_tmpdir([*ssh_command(), "-o", "BatchMode=yes", alias])
     if upload_dir is None:
         return False
     up = subprocess.run(
-        ["scp", "-q", "-o", "BatchMode=yes", str(shim), f"{alias}:{upload_dir}/safereach-shim"],
+        [
+            *scp_command(),
+            "-q",
+            "-o",
+            "BatchMode=yes",
+            str(shim),
+            f"{alias}:{upload_dir}/safereach-shim",
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -1524,7 +1535,7 @@ def _push_shim(alias: str) -> bool:
         return False
     inst = subprocess.run(
         [
-            "ssh",
+            *ssh_command(),
             "-o",
             "BatchMode=yes",
             alias,
@@ -1737,7 +1748,7 @@ def _shim_config(host: HostConfig, settings: Settings) -> dict[str, Any]:
 
 def _ssh_base(args: argparse.Namespace, host: HostConfig, settings: Settings) -> list[str]:
     port = host.ssh_port(settings.defaults)
-    return ["ssh", "-p", str(port), f"{args.admin_user}@{host.hostname}"]
+    return [*ssh_command(), "-p", str(port), f"{args.admin_user}@{host.hostname}"]
 
 
 def cmd_provision(args: argparse.Namespace) -> int:
@@ -1803,7 +1814,7 @@ def cmd_provision(args: argparse.Namespace) -> int:
         if upload_dir is None:
             say(f"{BAD} could not create a temporary directory on the host")
             return 1
-        failure = _upload(["scp", "-P", port], target, shim_path, conf_path, upload_dir)
+        failure = _upload([*scp_command(), "-P", port], target, shim_path, conf_path, upload_dir)
         if failure:
             say(f"{BAD} scp failed: {failure}")
             return 1
@@ -1852,13 +1863,13 @@ def cmd_shim_update(args: argparse.Namespace) -> int:
     for host in hosts:
         port = str(host.ssh_port(settings.defaults))
         target = f"{args.admin_user}@{host.hostname}"
-        upload_dir = _remote_tmpdir(["ssh", "-p", port, target])
+        upload_dir = _remote_tmpdir([*ssh_command(), "-p", port, target])
         if upload_dir is None:
             say(f"{BAD} {host.alias}: could not create a temporary directory on the host")
             failures += 1
             continue
         up = subprocess.run(
-            ["scp", "-P", port, str(shim_path), f"{target}:{upload_dir}/safereach-shim"],
+            [*scp_command(), "-P", port, str(shim_path), f"{target}:{upload_dir}/safereach-shim"],
             capture_output=True,
             text=True,
             check=False,
@@ -1869,7 +1880,7 @@ def cmd_shim_update(args: argparse.Namespace) -> int:
             continue
         inst = subprocess.run(
             [
-                "ssh",
+                *ssh_command(),
                 "-p",
                 port,
                 target,

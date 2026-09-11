@@ -436,6 +436,27 @@ proves only that the input was empty.
 
 ---
 
+### End to end, against a real host
+
+Everything above runs in-process. The controls that matter most — the hardened enrolment
+as root, the sshd `Match` block, the sudoers file, the proxy's unix socket, the forced
+command over a real SSH channel — are exercised for real against a disposable
+production-like host: Ubuntu 24.04 with systemd, sshd, sudo, journald and its own Docker
+daemon, in a privileged container on your machine.
+
+```bash
+SAFEREACH_E2E=1 uv run pytest tests/e2e -v      # needs Docker; a few minutes
+python -m tests.e2e.rig up                        # or keep one running to poke at
+python -m tests.e2e.rig destroy
+```
+
+It enrols the host with `--hardened --allow-exec`, then asserts on the host itself
+(policy `0640 root:diag`, socket `0660`, `sshd -T -C user=diag`, `visudo -c`), replays
+every reproduction string from the security review through the real shim, checks the
+legal diagnostics come back with their secrets scrubbed, and confirms another local
+account can read neither the policy nor the socket. Run it before every release that
+touches `cli.py`, the scripts, or the spec.
+
 ## Release notes
 
 ### 0.3.0 — host state: policy file, proxy socket, sshd, sudoers, key pinning
@@ -631,6 +652,11 @@ decorative.
 ---
 
 ## Troubleshooting
+
+`SAFEREACH_SSH_CONFIG=/path/to/ssh_config` makes every `ssh` and `scp` safereach runs use
+that file instead of `~/.ssh/config`. OpenSSH resolves `~` from the passwd entry, not
+`$HOME`, so this is the only way to point enrolment at a config kept elsewhere.
+
 
 ```bash
 safereach doctor          # config, keys, connectivity, shim versions
