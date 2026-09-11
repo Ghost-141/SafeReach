@@ -6,8 +6,15 @@ refuses every host until `safereach shim-update --all` runs.
 
 ## 0.3.0 — host state: policy file, proxy socket, sshd, sudoers, key pinning
 
-Needs `safereach enroll <host> --hardened` again on each production host (idempotent, one
-command per host). The shim fingerprint is unchanged, so hosts keep working until then.
+**This is the first release after 0.1.1.** The 0.1.3 and 0.2.0 entries below were never
+published on their own; their changes shipped here. Upgrading from 0.1.1 therefore needs
+all three steps, in this order:
+
+```bash
+uvx safereach@0.3.0 install         # repoint the agents
+safereach shim-update --all         # the 0.2.0 fingerprint change; hosts are refused until this runs
+safereach enroll <host> --hardened  # the 0.3.0 host-state changes; idempotent, one per host
+```
 
 - `/etc/safereach/config.json` is installed `0640 root:diag` instead of `0644`. It holds
   the HMAC key for the secret digests; world-readable, any local user could brute-force
@@ -32,6 +39,8 @@ command per host). The shim fingerprint is unchanged, so hosts keep working unti
   shell access, not a missing package, and the message says so.
 
 ## 0.2.0 — closes the secret-leak paths found in review
+
+*Not published separately; shipped in 0.3.0.*
 
 Every deployed shim is refused until `safereach shim-update --all` runs: the fingerprint
 changed, and a host on the old rules is refused rather than quietly served. Upgrade with
@@ -76,6 +85,8 @@ the policy file or the shim. The reproduction strings from the review are in the
 corpus and run through the built shim as well as the in-process validator.
 
 ## 0.1.3
+
+*Not published separately; shipped in 0.3.0.*
 
 - **The published wheel could not enrol a host.** 0.1.0 and 0.1.1 packaged
   `shim_main.py` but not the builder that assembles it, so `enroll`, `provision`,
