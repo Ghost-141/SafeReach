@@ -36,11 +36,11 @@ hosts:
     # --- docker -----------------------------------------------------------------
     # Point at a READ-ONLY socket proxy, not /var/run/docker.sock. Membership of the
     # docker group is equivalent to root on the host, so the proxy is what keeps a
-    # parser bug from becoming a host compromise.
-    #   docker run -d --name dsp -p 127.0.0.1:2375:2375 \
-    #     -e CONTAINERS=1 -e IMAGES=1 -e NETWORKS=1 -e VOLUMES=1 -e POST=0 -e EXEC=0 \
-    #     -v /var/run/docker.sock:/var/run/docker.sock:ro tecnativa/docker-socket-proxy
-    docker_host: "tcp://127.0.0.1:2375"
+    # parser bug from becoming a host compromise. `enroll --hardened` starts one on a
+    # unix socket readable by the diag group only and writes this value for you:
+    docker_host: "unix:///run/safereach/docker.sock"
+    # A TCP proxy (tcp://127.0.0.1:2375) also works; its port is then refused to curl
+    # however curl_targets is written.
 
     # Container env values are masked by default — Config.Env is where DATABASE_URL and
     # *_TOKEN live, and `docker inspect` is a command the agent will call constantly.

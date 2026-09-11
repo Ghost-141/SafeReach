@@ -19,8 +19,8 @@ or reach a host it wasn't granted.
 ## Quick start
 
 ```bash
-uvx safereach@0.2.0 enroll --all      # set up every server you can already ssh to
-uvx safereach@0.2.0 install           # register with your agents
+uvx safereach@0.3.0 enroll --all      # set up every server you can already ssh to
+uvx safereach@0.3.0 install           # register with your agents
 ```
 
 > **Pre-release:** until this is on PyPI, install from source and register with
@@ -131,7 +131,7 @@ the socket proxy. A proxy bug lands on an account that cannot do much anyway.
 ### Recommended — `uvx`, pinned
 
 ```bash
-uvx safereach@0.2.0 --help
+uvx safereach@0.3.0 --help
 ```
 
 Nothing installed globally, and it is the one launch form that works identically for every
@@ -147,7 +147,7 @@ recommended.
 ### Alternative — a persistent install
 
 ```bash
-uv tool install safereach==0.2.0
+uv tool install safereach==0.3.0
 ```
 
 ### From source
@@ -200,11 +200,24 @@ Needs sudo on the target once. Additionally:
 
 - creates an unprivileged `diag` user — **no sudo**, **not in the `docker` group**
 - installs the shim to `/usr/local/bin` and its policy to `/etc/safereach`, both
-  **root-owned**, so the account cannot rewrite what it is allowed to run
-- starts a **read-only Docker socket proxy** (`POST=0 EXEC=0`), bound to localhost — and
-  the shim refuses `curl` to that port however `curl_targets` is written
-- writes an exact-match sudoers entry for enabled recipes only — never `sudo` itself
+  **root-owned**, so the account cannot rewrite what it is allowed to run. The policy is
+  `0640 root:diag`: it holds the HMAC key for the secret digests, and no other local
+  account can read it
+- starts a **read-only Docker socket proxy** (`POST=0 EXEC=0`), pinned by image digest,
+  listening on a **unix socket** (`/run/safereach/docker.sock`, mode `0660`, diag group)
+  rather than a TCP port — reachable by `docker` running as `diag` and by nothing else.
+  Where the socket bind is not possible it falls back to loopback TCP limited to the
+  diag uid by `iptables`, and the shim refuses `curl` to that port however
+  `curl_targets` is written
+- writes an exact-match sudoers entry for enabled recipes only — never `sudo` itself —
+  with the binary path resolved on that host, so `/bin/dmesg` and `/usr/bin/dmesg`
+  hosts both match
+- adds an sshd `Match User diag` drop-in (`MaxSessions 4`, no forwarding, no TTY),
+  validated with `sshd -t` before it is kept and reloaded only if it validates
 - makes the audit log **append-only** (`chattr +a`), so the account cannot erase its trail
+- offers **only the enrolled key** to the host: the SSH agent is asked for that identity
+  and no other, so a personal key that is also authorised there can never win the
+  handshake and land in an account without the forced command
 - runs every command under `nice -n 19`, `ionice -c 3` and a `prlimit` CPU cap where those
   exist, so a diagnostic loses every scheduling contest with the workload it is diagnosing
 
@@ -425,11 +438,38 @@ proves only that the input was empty.
 
 ## Release notes
 
+### 0.3.0 — host state: policy file, proxy socket, sshd, sudoers, key pinning
+
+Needs `safereach enroll <host> --hardened` again on each production host (idempotent, one
+command per host). The shim fingerprint is unchanged, so hosts keep working until then.
+
+- `/etc/safereach/config.json` is installed `0640 root:diag` instead of `0644`. It holds
+  the HMAC key for the secret digests; world-readable, any local user could brute-force
+  weak values offline.
+- The digest key is delivered inside the enrolment script on stdin, never as a sudo
+  argument — sudo logs its argv to the journal, which the diag account reads.
+- The Docker proxy is pinned by image digest and listens on a unix socket readable by
+  the diag group only, not on a loopback TCP port every local user could reach. Falls
+  back to uid-filtered TCP where the socket bind is not possible, and says which.
+- An sshd `Match User diag` drop-in duplicates the key-line restrictions at the daemon
+  level and caps sessions at 4. Written only where sshd includes `sshd_config.d`,
+  validated with `sshd -t` and `sshd -T -C user=diag`, removed if either fails.
+- `provision` writes the same sudoers block and recipe table as `enroll --hardened`;
+  recipes use bare binary names and the sudoers line carries the path `command -v`
+  finds on that host, so the two cannot disagree.
+- Uploads go to a `mktemp -d` directory on the host, not fixed names under `/tmp`.
+- The server pins the SSH agent to the enrolled key's identity. asyncssh otherwise tries
+  every agent key first, and on a plain-enrol host the operator's own key is authorised
+  for the same account — without the forced command.
+- `check_connectivity` and `doctor` now report `unrestricted` when a login shell, not
+  the shim, answers the version probe on a host that requires one: that is a key with
+  shell access, not a missing package, and the message says so.
+
 ### 0.2.0 — closes the secret-leak paths found in review
 
 Every deployed shim is refused until `safereach shim-update --all` runs: the fingerprint
 changed, and a host on the old rules is refused rather than quietly served. Upgrade with
-`uvx safereach@0.2.0 install`, then `safereach shim-update --all`.
+`uvx safereach@0.3.0 install`, then `safereach shim-update --all`.
 
 **Removed capabilities (Layer 0)** — each was reproduced returning secrets:
 - `curl_targets` entries are now `host:port`; a bare host covers 80 and 443 only. It used
