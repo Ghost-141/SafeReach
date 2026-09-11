@@ -129,7 +129,60 @@ the socket proxy. A proxy bug lands on an account that cannot do much anyway.
 
 ## Threat model
 
-What this is built to hold against, and what it is not.
+What this is built to hold against, and what it is not. The picture is the claim: the
+agent can influence everything in the amber zone, and none of it is a control. The red
+zone is root-owned on the host, reads nothing from the wire, and is what actually decides.
+
+```mermaid
+flowchart TB
+    subgraph INFL["ATTACKER-INFLUENCEABLE — the agent's reach"]
+        direction TB
+        CTX["agent context<br/><i>logs it just read, prompt injection,<br/>a poisoned tool result</i>"]
+        AGENT["AI agent"]
+        MCP["safereach MCP server<br/><i>stdio, on the operator's machine</i>"]
+        V1["client-side validator<br/><i>same rules — for fast, helpful denials</i>"]
+        HY["hosts.yaml<br/><i>aliases, curl_targets, production: true</i>"]
+        LAUD["local audit log"]
+        CTX --> AGENT
+        AGENT -->|"run_command(...)"| MCP
+        MCP --> V1
+        MCP -.-> HY
+        MCP -.-> LAUD
+    end
+
+    MCP ==>|"SSH, enrolled key only<br/><b>@run [json argv]</b> — never a shell string"| SSHD
+
+    subgraph HOST["THE CONTROLS — root-owned on the host, nothing from the wire"]
+        direction TB
+        SSHD["sshd<br/><i>forced command on the key +<br/>Match User diag: no TTY, no forwarding</i>"]
+        SHIM["safereach-shim<br/><i>embedded spec + validator + redaction<br/>fingerprint checked on every call</i>"]
+        POL["/etc/safereach/config.json<br/><i>0640 root:diag — allow, curl_targets,<br/>exec prefixes, digests</i>"]
+        DIAG["diag account<br/><i>no sudo, not in docker group</i>"]
+        SUDO["sudoers: named recipes only<br/><i>exact match, host-resolved path</i>"]
+        PROXY["docker socket proxy<br/><i>read-only API, unix socket 0660 diag</i>"]
+        HAUD["/var/log/safereach.jsonl<br/><i>append-only</i>"]
+        SSHD -->|"$SSH_ORIGINAL_COMMAND"| SHIM
+        POL -.->|"policy"| SHIM
+        SHIM -->|"argv, no shell"| DIAG
+        DIAG -->|"@elevated name"| SUDO
+        DIAG -->|"DOCKER_HOST"| PROXY
+        SHIM -.-> HAUD
+    end
+
+    subgraph TRUST["ASSUMED TRUSTED"]
+        ROOT["root on the host ·<br/>the operator at enrolment ·<br/>the machine enrol runs from"]
+    end
+    ROOT -.->|"writes, once"| HOST
+
+    style INFL fill:#fff8e1,stroke:#c90,stroke-dasharray:5 3
+    style HOST fill:#fff0f0,stroke:#c00,stroke-width:2px
+    style TRUST fill:#f0f0f0,stroke:#888
+    style SHIM fill:#ffe0e0,stroke:#c00,stroke-width:2px
+    style POL fill:#ffe0e0,stroke:#c00
+    style SSHD fill:#ffe0e0,stroke:#c00
+    style PROXY fill:#e0f0ff,stroke:#06c
+    style CTX fill:#fff3cd,stroke:#c90
+```
 
 **Assumed hostile:** the agent, and everything in its context. A prompt injection in a log
 line the agent just read is the expected attack, not an edge case. Everything the agent can
