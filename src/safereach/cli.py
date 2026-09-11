@@ -1549,6 +1549,89 @@ def _push_shim(alias: str) -> bool:
     return inst.returncode == 0
 
 
+def _host_mode(host: HostConfig, settings: Settings) -> tuple[str, str]:
+    """What the config alone can say about a host's security mode, and how to style it.
+
+    `hardened` cannot be told from the file — the account on the far end decides that,
+    which is `doctor`'s job. What the file does know is whether the host has a remote
+    validator at all, and whether it connects through the operator's own ssh config.
+    """
+    if not host.shim_required(settings.defaults):
+        return "client-only", "bad"
+    if host.uses_ssh_config:
+        return "ssh-config", "warn"
+    return "enrolled", "ok"
+
+
+def cmd_hosts(args: argparse.Namespace) -> int:
+    """List every configured host with its address — the operator's view, not the agent's.
+
+    `list_hosts` on the MCP side hides hostnames on purpose, so the agent never learns an
+    address. That reasoning does not apply to the person at the terminal who wrote the
+    file. Reads the config only; no network, so it is instant and works offline.
+    """
+    try:
+        settings = load_settings(args.config)
+    except (FileNotFoundError, ValueError) as exc:
+        say(f"{BAD} {exc}")
+        return 1
+
+    rows = []
+    for alias, host in settings.hosts.items():
+        mode, style = _host_mode(host, settings)
+        rows.append(
+            {
+                "alias": alias,
+                "address": host.hostname or f"~/.ssh/config: {host.ssh_config_host}",
+                "user": host.user or "",
+                "port": host.ssh_port(settings.defaults),
+                "mode": mode,
+                "description": host.description or "",
+                "_style": style,
+            }
+        )
+
+    if args.json:
+        # stdout on purpose: this is a subcommand, not the server, and the point of
+        # --json is to be piped into something.
+        print(
+            json.dumps(
+                [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows], indent=2
+            )
+        )
+        return 0
+
+    if not rows:
+        say(f"{WARN} no hosts configured in {settings.source_path}")
+        say("   enrol one with: safereach enroll <host>")
+        return 1
+
+    table = status_table(
+        "Alias",
+        "Address",
+        "User",
+        "Port",
+        "Mode",
+        "Description",
+        title=f"Hosts ({len(rows)}) — {settings.source_path}",
+    )
+    for r in rows:
+        table.add_row(
+            f"[host]{r['alias']}[/host]",
+            r["address"],
+            r["user"],
+            str(r["port"]),
+            f"[{r['_style']}]{r['mode']}[/{r['_style']}]",
+            f"[muted]{r['description']}[/muted]",
+        )
+    console.print(table)
+    if any(r["mode"] != "enrolled" for r in rows):
+        say("")
+        say("   client-only: no remote validator; ssh-config: connects as your own account.")
+        say("   Run `safereach doctor` to see which enrolled hosts are hardened.")
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     problems = 0
 
@@ -1927,6 +2010,7 @@ connecting agents
   uninstall                     remove that registration
 
 checking and debugging
+  hosts                         list configured hosts with their addresses
   doctor                        verify config, keys, connectivity, shim versions
   validate                      test a command against the allowlist, offline
   init                          write a starter hosts.yaml
@@ -1949,6 +2033,7 @@ SUBCOMMAND_DESCRIPTIONS = {
     "discover": "Show which servers in ~/.ssh/config you can reach with your existing keys.\n\nRead-only: changes nothing locally or remotely. Useful before `enroll`.",
     "rename": "Give a host a friendlier name than the one discovery produced.\n\nPurely local — the remote host never knew the name, so nothing needs\nre-enrolling. The stable id is preserved, so audit history stays joined.",
     "validate": "Check whether a command would be allowed, without connecting to anything.\n\nShows the exact string that would run, including flags safereach injects.\nUseful when extending config/commands.yaml.",
+    "hosts": "List every configured host: alias, address, user, port, mode and description.\n\nReads hosts.yaml only — no network, works offline. The MCP tool `list_hosts`\ndeliberately hides addresses from the agent; this is the operator's view.\nAdd --json for a machine-readable list on stdout.",
     "doctor": "Verify config, key permissions, host reachability, and whether each host's\nremote validator matches this version.\n\nThe first thing to run when an agent reports something odd.",
     "provision": "Create a dedicated unprivileged account on a host, using your admin access.\n\nStronger than plain `enroll`: the account has no sudo and is not in the docker\ngroup, so it is a second barrier behind the command allowlist.",
     "shim-update": "Rebuild the remote validator and redeploy it.\n\nRun after changing config/commands.yaml. Hosts running an older copy are\nrefused rather than silently allowed to use a stale allowlist.",
@@ -1978,6 +2063,7 @@ COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     (
         "Checking and debugging",
         [
+            ("hosts", "list configured hosts with their addresses"),
             ("doctor", "verify config, keys, connectivity, shim versions"),
             ("validate", "test a command against the allowlist, offline"),
             ("init", "write a starter hosts.yaml"),
@@ -2172,6 +2258,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", help="apply this host's allow list and curl targets")
     p.add_argument("--curl-targets", nargs="*", default=None)
     p.set_defaults(func=cmd_validate)
+
+    p = sub.add_parser("hosts", help="list configured hosts with their addresses")
+    p.add_argument("--json", action="store_true", help="machine-readable list on stdout")
+    p.set_defaults(func=cmd_hosts)
 
     p = sub.add_parser("doctor", help="verify config, keys, connectivity and shim versions")
     p.add_argument("--offline", action="store_true", help="skip network checks")

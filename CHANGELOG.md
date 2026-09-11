@@ -4,6 +4,14 @@ All notable changes, newest first. Versions are PyPI releases; each is tagged `v
 Every entry says what a user has to do on upgrade, because a shim fingerprint change
 refuses every host until `safereach shim-update --all` runs.
 
+## Unreleased
+
+- New `safereach hosts`: every configured host as a table — alias, address, user, port,
+  mode (`enrolled`, `ssh-config`, `client-only`) and description. Reads `hosts.yaml`
+  only, so it is instant and works offline. `--json` prints the same list on stdout for
+  scripting. The MCP tool `list_hosts` still hides addresses from the agent; this is the
+  operator's view.
+
 ## 0.3.0 — host state: policy file, proxy socket, sshd, sudoers, key pinning
 
 **This is the first release after 0.1.1.** The 0.1.3 and 0.2.0 entries below were never

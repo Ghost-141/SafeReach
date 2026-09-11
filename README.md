@@ -166,6 +166,7 @@ Before pointing an agent at a host that matters:
 
 - [ ] Enrolled with `--hardened`, never plain `enroll` or `discover`
 - [ ] `defaults.production: true` in `hosts.yaml`, so weaker modes cannot creep back in
+- [ ] `safereach hosts` shows only the hosts you meant, every one `enrolled`
 - [ ] `safereach doctor` shows every host `hardened`, shim fingerprint matching
 - [ ] `curl_targets` lists only the `host:port` pairs the agent needs, or is empty
 - [ ] `--allow-exec` off, or on with explicit `--exec-container` and `--exec-path`
@@ -184,7 +185,7 @@ inside containers: [docs/hosts.md](docs/hosts.md).
 
 | Tool | Purpose |
 |---|---|
-| `list_hosts` | Aliases, descriptions, security mode. Never hostnames, users or key paths. |
+| `list_hosts` | Aliases, descriptions, security mode. Never hostnames, users or key paths — those are yours, via `safereach hosts`. |
 | `select_host` | Pin a server for the session. |
 | `describe_commands` | The allowlist in readable form — what may run, and how. |
 | `run_command` | Validate → execute → structured result. `host` is optional. |
@@ -221,6 +222,7 @@ prevent. Enrolment is idempotent, so re-running it is always safe.
 ## Troubleshooting
 
 ```bash
+safereach hosts           # every configured host: alias, address, user, port, mode
 safereach doctor          # config, keys, connectivity, shim versions
 safereach doctor --fix    # re-push a drifted shim
 safereach validate "journalctl -u nginx -n 200" --host myserver
@@ -237,7 +239,7 @@ Every message the tool can produce, and what to do about it:
 |---|---|
 | [SECURITY.md](SECURITY.md) | Threat model in full, the four secret-protection layers, non-destruction by construction, the hardened host footprint, and how to report a vulnerability |
 | [docs/architecture.md](docs/architecture.md) | Request lifecycle and defence-in-depth diagrams |
-| [docs/hosts.md](docs/hosts.md) | Naming and renaming hosts, enrolment modes compared, container inspection |
+| [docs/hosts.md](docs/hosts.md) | Listing hosts, naming and renaming, enrolment modes compared, container inspection |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptoms, causes, and the SSH config override |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup, the test layers, extending the allowlist, releasing |
 | [CHANGELOG.md](CHANGELOG.md) | What changed, and what to run on each host after upgrading |
