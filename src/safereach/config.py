@@ -38,10 +38,15 @@ def resolve_data_file(name: str) -> Path:
     packaged = Path(__file__).parent / "data" / name
     if packaged.is_file():
         return packaged
-    repo = Path(__file__).resolve().parents[2] / "config" / name
-    if repo.is_file():
-        return repo
-    raise FileNotFoundError(f"could not locate {name}; looked in {packaged} and {repo}")
+    # In a source checkout the same files live in two directories: config/ holds the
+    # YAML, shim/ holds shim_main.py. Both are force-included under data/ in the wheel.
+    repo = Path(__file__).resolve().parents[2]
+    candidates = [repo / "config" / name, repo / "shim" / name]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    looked = ", ".join(str(c) for c in (packaged, *candidates))
+    raise FileNotFoundError(f"could not locate {name}; looked in {looked}")
 
 
 class Defaults(BaseModel):

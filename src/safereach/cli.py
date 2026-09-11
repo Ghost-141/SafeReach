@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import __version__, naming
+from . import __version__, naming, shimbuild
 from .audit import AuditLog
 from .config import (
     DEFAULT_CONFIG_PATH,
@@ -1509,27 +1509,38 @@ AUTHKEY_OPTS = (
 
 
 def _build_shim() -> tuple[Path, str]:
-    """Build the shim into a temp file and return its path and fingerprint."""
-    repo_build = Path(__file__).resolve().parents[2] / "shim" / "build.py"
-    spec = load_command_spec()
-    expected = fingerprint(spec)
+    """Build the shim into a temp file and return its path and fingerprint.
 
-    if repo_build.is_file():
-        out = Path(tempfile.mkdtemp(prefix="safereach-shim-")) / "safereach-shim"
-        proc = subprocess.run(
-            [sys.executable, str(repo_build), "--out", str(out)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(f"shim build failed: {proc.stderr.strip()}")
-        return out, expected
+    Built from the installed package's own sources, never from a repo checkout or a
+    pre-built artifact: 0.1.0 and 0.1.1 shipped without either, so every enrolment from a
+    `uvx` install failed. Assembling it here means the wheel that runs the server is the
+    wheel that produces the shim, and the two fingerprints cannot disagree.
+    """
+    out = Path(tempfile.mkdtemp(prefix="safereach-shim-")) / "safereach-shim"
+    try:
+        version = shimbuild.write(out)
+    except (RuntimeError, SyntaxError, FileNotFoundError) as exc:
+        raise RuntimeError(f"shim build failed: {exc}") from exc
+    return out, version
 
-    packaged = Path(__file__).parent / "data" / "safereach-shim"
-    if packaged.is_file():
-        return packaged, expected
-    raise RuntimeError("cannot locate shim/build.py or a packaged safereach-shim")
+
+def cmd_shim_build(args: argparse.Namespace) -> int:
+    """Write the shim to a file without deploying it.
+
+    For hosts configured by hand or by configuration management, and for the release
+    smoke test that proves the published wheel can still produce a working shim.
+    """
+    try:
+        if args.print_version:
+            print(shimbuild.build()[1])
+            return 0
+        out = Path(args.out).expanduser()
+        version = shimbuild.write(out)
+    except (RuntimeError, SyntaxError, FileNotFoundError) as exc:
+        say(f"{BAD} shim build failed: {exc}")
+        return 1
+    say(f"{OK} wrote {out} (fingerprint {version})")
+    return 0
 
 
 def _shim_config(host: HostConfig, settings: Settings) -> dict[str, Any]:
@@ -1726,6 +1737,7 @@ setting up servers
   provision                     create a dedicated unprivileged account on a host
   rename                        give a host a friendlier name (local, no re-enrol)
   shim-update                   redeploy the remote validator after a spec change
+  shim-build                    write the remote validator to a file, no deploy
 
 connecting agents
   install                       register this server with your AI agents
@@ -1757,6 +1769,7 @@ SUBCOMMAND_DESCRIPTIONS = {
     "doctor": "Verify config, key permissions, host reachability, and whether each host's\nremote validator matches this version.\n\nThe first thing to run when an agent reports something odd.",
     "provision": "Create a dedicated unprivileged account on a host, using your admin access.\n\nStronger than plain `enroll`: the account has no sudo and is not in the docker\ngroup, so it is a second barrier behind the command allowlist.",
     "shim-update": "Rebuild the remote validator and redeploy it.\n\nRun after changing config/commands.yaml. Hosts running an older copy are\nrefused rather than silently allowed to use a stale allowlist.",
+    "shim-build": "Write the remote validator (safereach-shim) to a file without deploying it.\n\nFor hosts you configure by hand or through configuration management, and\nfor checking that this install can produce a shim at all. The fingerprint\nprinted is the one the server will expect every host to report.",
 }
 
 
@@ -1769,6 +1782,7 @@ COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
             ("provision", "create a dedicated unprivileged account on a host"),
             ("rename", "give a host a friendlier name (local, no re-enrol)"),
             ("shim-update", "redeploy the remote validator after a spec change"),
+            ("shim-build", "write the remote validator to a file, no deploy"),
         ],
     ),
     (
@@ -1991,6 +2005,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true")
     p.add_argument("--admin-user", default=os.environ.get("USER", "root"))
     p.set_defaults(func=cmd_shim_update)
+
+    p = sub.add_parser("shim-build", help="write the shim to a file without deploying it")
+    p.add_argument("--out", default="./safereach-shim", help="destination path")
+    p.add_argument(
+        "--print-version", action="store_true", help="print the fingerprint only, build nothing"
+    )
+    p.set_defaults(func=cmd_shim_build)
 
     _describe_subcommands(sub)
     return parser

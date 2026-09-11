@@ -19,8 +19,8 @@ or reach a host it wasn't granted.
 ## Quick start
 
 ```bash
-uvx safereach@0.1.2 enroll --all      # set up every server you can already ssh to
-uvx safereach@0.1.2 install           # register with your agents
+uvx safereach@0.1.3 enroll --all      # set up every server you can already ssh to
+uvx safereach@0.1.3 install           # register with your agents
 ```
 
 > **Pre-release:** until this is on PyPI, install from source and register with
@@ -131,7 +131,7 @@ the socket proxy. A proxy bug lands on an account that cannot do much anyway.
 ### Recommended — `uvx`, pinned
 
 ```bash
-uvx safereach@0.1.2 --help
+uvx safereach@0.1.3 --help
 ```
 
 Nothing installed globally, and it is the one launch form that works identically for every
@@ -147,7 +147,7 @@ recommended.
 ### Alternative — a persistent install
 
 ```bash
-uv tool install safereach==0.1.2
+uv tool install safereach==0.1.3
 ```
 
 ### From source
@@ -392,6 +392,22 @@ proves only that the input was empty.
 ---
 
 ## Release notes
+
+### 0.1.3
+
+- **The published wheel could not enrol a host.** 0.1.0 and 0.1.1 packaged
+  `shim_main.py` but not the builder that assembles it, so `enroll`, `provision`,
+  `shim-update` and `doctor --fix` all failed from a `uvx` install with
+  "cannot locate shim/build.py or a packaged safereach-shim". Only source checkouts
+  worked, and every test ran from one.
+- The bundler now lives inside the package (`safereach.shimbuild`) and builds the shim
+  at runtime from the installed `validator.py`, `redact.py`, `commands.yaml` and
+  `shim_main.py`. There is no pre-built artifact to go stale, and the fingerprint the
+  shim reports matches the one the server expects by construction.
+- New `safereach shim-build [--out PATH | --print-version]` for hand-configured hosts
+  and for checking an install can produce a shim at all.
+- The release smoke test now builds a shim from the installed wheel, runs it, and
+  compares its fingerprint with the server's. A new test does the same in the suite.
 
 ### 0.1.2
 

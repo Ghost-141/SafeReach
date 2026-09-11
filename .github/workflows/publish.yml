@@ -101,13 +101,20 @@ jobs:
         run: uv run --with twine twine check dist/*
 
       # A wheel that imports but cannot find its packaged commands.yaml is useless, and
-      # that only fails outside the source tree.
+      # that only fails outside the source tree. The same goes for the shim: 0.1.0 and
+      # 0.1.1 passed a smoke test like this and still could not enrol a single host,
+      # because nothing here asked the installed package to build one.
       - name: Smoke-test the wheel in a clean environment
         run: |
           uv venv /tmp/verify
           uv pip install --python /tmp/verify/bin/python dist/*.whl
           /tmp/verify/bin/safereach --version
           /tmp/verify/bin/safereach validate "journalctl -u nginx -n 5"
+          /tmp/verify/bin/safereach shim-build --out /tmp/verify/safereach-shim
+          REPORTED=$(python3 /tmp/verify/safereach-shim --version)
+          EXPECTED=$(/tmp/verify/bin/safereach shim-build --print-version)
+          echo "shim fingerprint: $REPORTED (server expects $EXPECTED)"
+          [ "$REPORTED" = "$EXPECTED" ] || { echo "shim fingerprint mismatch"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:
