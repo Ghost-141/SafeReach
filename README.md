@@ -580,8 +580,9 @@ safereach shim-update --all       # when the release changed the allowlist or th
 safereach enroll <host> --hardened  # when the release changed root-owned host state
 ```
 
-Until `shim-update` runs, a host on the old rules is **refused**, with a message naming
-the fingerprints. That is deliberate: a host quietly running an older, looser allowlist is
+Coming from 0.1.1? Go straight to 0.3.0 and run all three: 0.1.3 and 0.2.0 were never
+published on their own. Until `shim-update` runs, a host on the old rules is **refused**,
+with a message naming the fingerprints. That is deliberate: a host quietly running an older, looser allowlist is
 the failure mode this tool exists to prevent. Enrolment is idempotent, so re-running it
 is always safe.
 
