@@ -42,6 +42,11 @@ Issues = "https://github.com/Ghost-141/SafeReach/issues"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# README images are referenced by absolute URL, so the files themselves are not needed in
+# either artifact; 6 MB of PNG has no business in an sdist.
+[tool.hatch.build.targets.sdist]
+exclude = ["diagram/"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/safereach"]
 

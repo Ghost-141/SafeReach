@@ -39,37 +39,7 @@ If `ssh myserver` works today, the agent can diagnose `myserver`.
 The validator runs **twice**, on both sides of the SSH connection. That is the central
 design decision and the reason this can be pointed at production.
 
-```mermaid
-flowchart LR
-    subgraph LOCAL["your machine"]
-        AGENT["AI agent<br/>Claude Code · Codex · Cursor"]
-        MCP["safereach<br/><i>MCP server, stdio</i>"]
-        V1["validator<br/><i>client-side: fast,<br/>helpful denials</i>"]
-        AUD["audit log<br/><i>JSONL</i>"]
-        AGENT <-->|"JSON-RPC"| MCP
-        MCP --> V1
-        MCP --> AUD
-    end
-
-    subgraph REMOTE["remote host"]
-        SSHD["sshd<br/><i>forced command</i>"]
-        SHIM["safereach-shim<br/><i>root-owned</i>"]
-        V2["validator<br/><b>the real boundary</b>"]
-        RED["redaction<br/><i>3 layers</i>"]
-        PROXY["docker socket proxy<br/><i>POST=0 EXEC=0</i>"]
-        CMD["allowlisted binaries<br/><i>as unprivileged diag</i>"]
-        SSHD --> SHIM --> V2 --> CMD
-        CMD --> RED
-        SHIM -.->|"DOCKER_HOST"| PROXY
-    end
-
-    V1 -->|"SSH · key pinned to<br/>a forced command"| SSHD
-    RED -->|"masked output"| MCP
-
-    style V2 fill:#ffe0e0,stroke:#c00,stroke-width:2px
-    style RED fill:#fff3cd,stroke:#c90
-    style PROXY fill:#e0f0ff,stroke:#06c
-```
+<p align="center"><img src="https://raw.githubusercontent.com/Ghost-141/SafeReach/main/diagram/architecture.png" alt="Architecture: the validator runs on your machine and again on the host behind an SSH forced command; output comes back redacted" width="100%"></p>
 
 **Why twice.** The MCP server runs on the agent's own machine, so a check that lives there
 is one the agent's environment can influence — via a compromised server, a poisoned
@@ -79,48 +49,11 @@ control that actually holds, because it sits outside everything the agent can re
 
 ### Request lifecycle
 
-```mermaid
-sequenceDiagram
-    participant A as Agent
-    participant M as MCP server
-    participant S as sshd
-    participant H as safereach-shim
-    participant C as Command
-
-    A->>M: run_command("journalctl -u nginx -n 200")
-    M->>M: resolve alias → host config
-    M->>M: validate (client-side)
-    Note over M: rejection → ToolError<br/>with a legal alternative
-    M->>S: @run ["journalctl","-u","nginx","-n","200"]
-    Note over M,S: structured argv, never a shell string
-    S->>H: forced command · $SSH_ORIGINAL_COMMAND
-    H->>H: validate_argv (independently)
-    Note over H: no tokenisation here —<br/>the two sides cannot disagree
-    H->>C: exec, no shell, no PTY
-    C-->>H: stdout
-    H->>H: redact: structural → by-name → by-digest
-    H-->>M: masked output
-    M->>M: audit record
-    M-->>A: CommandResult
-```
+<p align="center"><img src="https://raw.githubusercontent.com/Ghost-141/SafeReach/main/diagram/request-lifecycle.png" alt="Request lifecycle: agent → MCP server (client-side validation) → sshd forced command → shim (independent validation) → command → redaction → audit → masked result" width="100%"></p>
 
 ### Defence in depth
 
-```mermaid
-flowchart TD
-    T["agent asks for<br/>something destructive"] --> L1
-    L1{"client validator"} -->|refused| X1["explained, with<br/>a legal alternative"]
-    L1 -->|"bug / bypassed"| L2
-    L2{"SSH forced command"} -->|refused| X2["the key can only<br/>invoke the shim"]
-    L2 --> L3
-    L3{"shim validator"} -->|refused| X3["independent of<br/>the agent's machine"]
-    L3 --> L4
-    L4{"docker socket proxy"} -->|refused| X4["mutation blocked at<br/>the API level"]
-    L4 --> L5
-    L5{"unprivileged diag<br/>no sudo, no docker group"} -->|refused| X5["no privilege<br/>to abuse"]
-
-    style L3 fill:#ffe0e0,stroke:#c00,stroke-width:2px
-```
+<p align="center"><img src="https://raw.githubusercontent.com/Ghost-141/SafeReach/main/diagram/defence-in-depth.png" alt="Defence in depth: client validator, SSH forced command, root-owned shim validator, Docker socket proxy, unprivileged diag account" width="100%"></p>
 
 **No single failure is catastrophic.** A parser bug lands on the shim. A shim bug lands on
 the socket proxy. A proxy bug lands on an account that cannot do much anyway.
@@ -133,56 +66,7 @@ What this is built to hold against, and what it is not. The picture is the claim
 agent can influence everything in the amber zone, and none of it is a control. The red
 zone is root-owned on the host, reads nothing from the wire, and is what actually decides.
 
-```mermaid
-flowchart TB
-    subgraph INFL["ATTACKER-INFLUENCEABLE — the agent's reach"]
-        direction TB
-        CTX["agent context<br/><i>logs it just read, prompt injection,<br/>a poisoned tool result</i>"]
-        AGENT["AI agent"]
-        MCP["safereach MCP server<br/><i>stdio, on the operator's machine</i>"]
-        V1["client-side validator<br/><i>same rules — for fast, helpful denials</i>"]
-        HY["hosts.yaml<br/><i>aliases, curl_targets, production: true</i>"]
-        LAUD["local audit log"]
-        CTX --> AGENT
-        AGENT -->|"run_command(...)"| MCP
-        MCP --> V1
-        MCP -.-> HY
-        MCP -.-> LAUD
-    end
-
-    MCP ==>|"SSH, enrolled key only<br/><b>@run [json argv]</b> — never a shell string"| SSHD
-
-    subgraph HOST["THE CONTROLS — root-owned on the host, nothing from the wire"]
-        direction TB
-        SSHD["sshd<br/><i>forced command on the key +<br/>Match User diag: no TTY, no forwarding</i>"]
-        SHIM["safereach-shim<br/><i>embedded spec + validator + redaction<br/>fingerprint checked on every call</i>"]
-        POL["/etc/safereach/config.json<br/><i>0640 root:diag — allow, curl_targets,<br/>exec prefixes, digests</i>"]
-        DIAG["diag account<br/><i>no sudo, not in docker group</i>"]
-        SUDO["sudoers: named recipes only<br/><i>exact match, host-resolved path</i>"]
-        PROXY["docker socket proxy<br/><i>read-only API, unix socket 0660 diag</i>"]
-        HAUD["/var/log/safereach.jsonl<br/><i>append-only</i>"]
-        SSHD -->|"$SSH_ORIGINAL_COMMAND"| SHIM
-        POL -.->|"policy"| SHIM
-        SHIM -->|"argv, no shell"| DIAG
-        DIAG -->|"@elevated name"| SUDO
-        DIAG -->|"DOCKER_HOST"| PROXY
-        SHIM -.-> HAUD
-    end
-
-    subgraph TRUST["ASSUMED TRUSTED"]
-        ROOT["root on the host ·<br/>the operator at enrolment ·<br/>the machine enrol runs from"]
-    end
-    ROOT -.->|"writes, once"| HOST
-
-    style INFL fill:#fff8e1,stroke:#c90,stroke-dasharray:5 3
-    style HOST fill:#fff0f0,stroke:#c00,stroke-width:2px
-    style TRUST fill:#f0f0f0,stroke:#888
-    style SHIM fill:#ffe0e0,stroke:#c00,stroke-width:2px
-    style POL fill:#ffe0e0,stroke:#c00
-    style SSHD fill:#ffe0e0,stroke:#c00
-    style PROXY fill:#e0f0ff,stroke:#06c
-    style CTX fill:#fff3cd,stroke:#c90
-```
+<p align="center"><img src="https://raw.githubusercontent.com/Ghost-141/SafeReach/main/diagram/trust-boundary.png" alt="Trust boundaries: what the agent can influence (context, MCP server, hosts.yaml, client validator) versus what the host enforces (sshd, shim, policy file, diag account, sudoers, socket proxy), and what is assumed trusted" width="100%"></p>
 
 **Assumed hostile:** the agent, and everything in its context. A prompt injection in a log
 line the agent just read is the expected attack, not an edge case. Everything the agent can
@@ -404,16 +288,7 @@ you want that history.
 
 ## Secret protection — four layers
 
-```mermaid
-flowchart TD
-    O["command output"] --> L0
-    L0["<b>Layer 0 · structural</b><br/>the data is never produced"] --> L1
-    L1["<b>Layer 1 · protected paths</b><br/>.env can't even be named"] --> L2
-    L2["<b>Layer 2 · by name</b><br/>learned from the host's .env keys"] --> L3
-    L3["<b>Layer 3 · by digest</b><br/>catches values with no name attached"] --> OUT["masked output"]
-    style L0 fill:#d4edda,stroke:#28a745
-    style L1 fill:#d4edda,stroke:#28a745
-```
+<p align="center"><img src="https://raw.githubusercontent.com/Ghost-141/SafeReach/main/diagram/secret-protection.png" alt="Secret protection in four layers: structural removal, protected paths, masking by name, masking by digest" width="100%"></p>
 
 **Layer 0 — remove the capability.** A control that deletes a field always beats one that
 filters it. `systemctl show` requires `--property` from a safe enum, so `Environment=` is
