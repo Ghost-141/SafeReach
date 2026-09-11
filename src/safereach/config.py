@@ -65,6 +65,13 @@ class Defaults(BaseModel):
     #: `doctor` to keep pointing it out.
     require_shim: bool = True
 
+    #: Production posture, declared once. When true, `load_settings` refuses to start
+    #: with any host in client-only mode (`require_shim: false`) or any host that
+    #: resolves through ~/.ssh/config, so the weaker modes are a startup error rather
+    #: than a `doctor` warning somebody has to read. Nothing the agent does can change
+    #: this file, which is what makes it a control rather than a preference.
+    production: bool = False
+
 
 class HostConfig(BaseModel):
     """One managed host.
@@ -269,11 +276,28 @@ def load_settings(path: Path | None = None) -> Settings:
             raise ValueError(f"{target}: host {alias!r} must be a mapping")
         hosts[alias] = HostConfig(alias=alias, **body)
 
-    return Settings(
-        defaults=Defaults(**(raw.get("defaults") or {})),
-        hosts=hosts,
-        source_path=target,
-    )
+    defaults = Defaults(**(raw.get("defaults") or {}))
+    if defaults.production:
+        _enforce_production(target, defaults, hosts)
+
+    return Settings(defaults=defaults, hosts=hosts, source_path=target)
+
+
+def _enforce_production(target: Path, defaults: Defaults, hosts: dict[str, HostConfig]) -> None:
+    """Refuse to start rather than run a production fleet in a weaker mode."""
+    problems = []
+    for alias, host in hosts.items():
+        if not host.shim_required(defaults):
+            problems.append(
+                f"{alias}: require_shim is false (client-only mode has no host-side control)"
+            )
+        if host.uses_ssh_config:
+            problems.append(
+                f"{alias}: resolves through ~/.ssh/config, so it connects as your own "
+                "account; production hosts must be enrolled --hardened with an explicit key"
+            )
+    if problems:
+        raise ValueError(f"{target}: defaults.production is true, but:\n  " + "\n  ".join(problems))
 
 
 def _resolve_config_path(path: Path | None) -> Path:

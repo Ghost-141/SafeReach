@@ -31,9 +31,21 @@ from pydantic import BaseModel, Field, create_model
 
 from .audit import AuditLog
 from .config import HostConfig, Settings, load_command_spec, load_settings
-from .redact import redact_docker_inspect, redact_text
+from .redact import (
+    redact_docker_inspect,
+    redact_text,
+    scrub_cgroup_cmdlines,
+    scrub_describe_environment,
+)
 from .ssh import ExecResult, SSHError, SSHPool
-from .validator import Rejected, render, spec_summary, validate
+from .validator import (
+    BUILTIN_DENY_PATHS,
+    Rejected,
+    docker_host_deny_targets,
+    render,
+    spec_summary,
+    validate,
+)
 from .versioning import fingerprint
 
 log = logging.getLogger("safereach")
@@ -155,7 +167,17 @@ def _host(app: AppContext, alias: str) -> HostConfig:
 
 
 def _host_ctx(host: HostConfig) -> dict[str, Any]:
-    return {"curl_targets": list(host.curl_targets)}
+    """The same context the shim builds from its own policy file.
+
+    Parity, not control: the shim re-derives all of this on the host. Matching it here
+    means the agent gets the same rejection message at the same point, instead of a
+    round trip to learn that `.env` is protected.
+    """
+    return {
+        "curl_targets": list(host.curl_targets),
+        "curl_deny_targets": docker_host_deny_targets(host.docker_host),
+        "deny_paths": list(BUILTIN_DENY_PATHS),
+    }
 
 
 async def _resolve_host(app: AppContext, ctx: Context[AppContext], host: str | None) -> HostConfig:
@@ -285,6 +307,10 @@ def _postprocess(host: HostConfig, argv: list[str], result: ExecResult) -> ExecR
     )
     if is_inspect or argv[:3] == ["docker", "compose", "config"]:
         stdout = redact_docker_inspect(stdout, host.env_allowlist)
+    if argv[:2] == ["systemctl", "status"]:
+        stdout = scrub_cgroup_cmdlines(stdout)
+    if argv[:2] == ["kubectl", "describe"]:
+        stdout = scrub_describe_environment(stdout)
 
     return ExecResult(
         exit_code=result.exit_code,

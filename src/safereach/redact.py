@@ -21,6 +21,8 @@ from typing import Any
 __all__ = [
     "redact_text",
     "redact_docker_inspect",
+    "scrub_cgroup_cmdlines",
+    "scrub_describe_environment",
     "mask_env_keys",
     "mask_by_digest",
     "digest_value",
@@ -57,14 +59,64 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         rf"\1\2{MASK}",
     ),
+    (
+        # Names that do not contain one of the words above but are secrets by
+        # convention: anything ending in _KEY (STRIPE_KEY, ENCRYPTION_KEY, PRIVATE_KEY),
+        # plus SALT, DSN, PASSPHRASE and the short forms PASS/PW. Only the value is
+        # masked, so `PUBLIC_KEY=` being caught costs a value the operator can look up,
+        # not a diagnosis.
+        re.compile(
+            r"([A-Za-z0-9_.\-]*"
+            r"(?:[_-]key|[_-]?secret|[_-]salt|[_-]dsn|passphrase|[_-]pass|[_-]pw|"
+            r"[_-]?signing|[_-]?bearer)"
+            r")(\s*[=:]\s*)(\S+)",
+            re.IGNORECASE,
+        ),
+        rf"\1\2{MASK}",
+    ),
     # Connection strings: keep scheme and host, drop the credentials.
     (
         re.compile(r"\b([a-z][a-z0-9+.\-]*://)([^:/@\s]+):([^@\s]+)@"),
         rf"\1\2:{MASK}@",
     ),
+    (
+        # Secrets passed as command-line options: `--password x`, `--token=x`. Seen in
+        # `systemctl status` cgroup trees, `ps` output and application logs alike.
+        re.compile(
+            r"(--?(?:password|passwd|pwd|token|secret|api[_-]?key|apikey|passphrase|"
+            r"auth[_-]?token|access[_-]?key|client[_-]?secret)(?:[= ]))(\S+)",
+            re.IGNORECASE,
+        ),
+        rf"\1{MASK}",
+    ),
+    (
+        # Database clients take the password glued to -p (`mysql -pSECRET`) or as the
+        # next token (`redis-cli -a SECRET`, `psql -W`). The client name anchors it so
+        # `tail -n 5` is untouched.
+        re.compile(r"(\b(?:mysql|mysqladmin|mysqldump|mariadb|mongosh|mongo)\b[^\n]*?\s-p)(\S+)"),
+        rf"\1{MASK}",
+    ),
+    (re.compile(r"(\bredis-cli\b[^\n]*?\s-a\s+)(\S+)"), rf"\1{MASK}"),
+    (re.compile(r"(\bBearer\s+)([A-Za-z0-9_.\-]{8,})"), rf"\1{MASK}"),
+    # Vendor token formats. Each is a fixed prefix plus a run the vendor documents, so
+    # these are cheap and rarely wrong.
     (re.compile(r"\b(AKIA[0-9A-Z]{16})\b"), MASK),
-    (re.compile(r"\b(ghp_[A-Za-z0-9]{20,})\b"), MASK),
+    (re.compile(r"\b(ASIA[0-9A-Z]{16})\b"), MASK),
+    (re.compile(r"\b(gh[opsu]_[A-Za-z0-9]{20,})\b"), MASK),
+    (re.compile(r"\b(github_pat_[A-Za-z0-9_]{20,})\b"), MASK),
+    (re.compile(r"\b(glpat-[A-Za-z0-9_\-]{20,})\b"), MASK),
     (re.compile(r"\b(xox[baprs]-[A-Za-z0-9-]{10,})\b"), MASK),
+    (re.compile(r"\b(xapp-[0-9]-[A-Za-z0-9-]{10,})\b"), MASK),
+    (re.compile(r"\b(sk_(?:live|test)_[A-Za-z0-9]{10,})\b"), MASK),
+    (re.compile(r"\b(rk_(?:live|test)_[A-Za-z0-9]{10,})\b"), MASK),
+    (re.compile(r"\b(AIza[0-9A-Za-z_\-]{35})\b"), MASK),
+    (re.compile(r"\b(sk-ant-[A-Za-z0-9_\-]{10,})\b"), MASK),
+    (re.compile(r"\b(sk-(?:proj-)?[A-Za-z0-9_\-]{20,})\b"), MASK),
+    (re.compile(r"\b(SG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,})\b"), MASK),
+    (re.compile(r"\b(hv[sbr]\.[A-Za-z0-9_\-]{20,})\b"), MASK),
+    (re.compile(r"\b(dckr_pat_[A-Za-z0-9_\-]{20,})\b"), MASK),
+    (re.compile(r"\b(npm_[A-Za-z0-9]{30,})\b"), MASK),
+    (re.compile(r"\b(pypi-[A-Za-z0-9_\-]{30,})\b"), MASK),
     (re.compile(r"\b(eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]+)\b"), MASK),
     (
         re.compile(r"^(Authorization\s*:\s*)(\S+.*)$", re.IGNORECASE | re.MULTILINE),
@@ -113,11 +165,21 @@ def redact_docker_inspect(text: str, env_allowlist: list[str] | None = None) -> 
     return json.dumps(data, indent=2)
 
 
+#: Keys in `docker inspect` output whose values are command-line arguments. They are
+#: not masked wholesale — `--port 8080` is a diagnosis — but each element goes through
+#: the argument-style patterns, so `--password x` and `mysql -px` are caught in place.
+_ARGV_KEYS = frozenset({"Cmd", "Entrypoint", "Args"})
+
+
 def _walk_and_mask(node: Any, allowed: set[str]) -> None:
     if isinstance(node, dict):
         for key, value in node.items():
             if key == "Env" and isinstance(value, list):
                 node[key] = [_mask_env_entry(e, allowed) for e in value]
+            elif key in _ARGV_KEYS and isinstance(value, list):
+                joined = redact_text(" ".join(v for v in value if isinstance(v, str)))
+                masked = joined.split(" ") if joined else []
+                node[key] = masked if len(masked) == len(value) else [MASK] * len(value)
             else:
                 _walk_and_mask(value, allowed)
     elif isinstance(node, list):
@@ -145,6 +207,69 @@ def _mask_env_lines(text: str, allowed: set[str]) -> str:
         return f"{indent}{name}={MASK}"
 
     return _ENV_LINE_RE.sub(sub, text)
+
+
+# --------------------------------------------------------------------------------------
+# Structural scrubs for two outputs whose shape, not their words, says where the
+# secrets are
+# --------------------------------------------------------------------------------------
+
+#: A process line in a `systemctl status` CGroup tree: tree glyphs, a PID, then argv.
+_CGROUP_LINE_RE = re.compile(r"^(\s*[│ ]*[├└]─\s*\d+\s+)(\S+)(\s.*)?$", re.MULTILINE)
+
+
+def scrub_cgroup_cmdlines(text: str) -> str:
+    """Reduce every process line in a CGroup tree to its PID and executable.
+
+    The rest of `systemctl status` — state, timestamps, recent journal lines — is left
+    alone. Only the argv is dropped, because argv is where `mysql -pSECRET` lives and no
+    word-based pattern knows every client's password flag. Driven by the line's shape,
+    not by what the arguments look like, so it cannot be fooled by an unfamiliar one.
+    """
+    if not text:
+        return text
+
+    def sub(match: re.Match[str]) -> str:
+        prefix, exe, rest = match.group(1), match.group(2), match.group(3)
+        return f"{prefix}{exe} …" if rest and rest.strip() else f"{prefix}{exe}"
+
+    return _CGROUP_LINE_RE.sub(sub, text)
+
+
+#: `kubectl describe` prints inline env values under an `Environment:` heading, one
+#: `NAME:  value` per line, indented deeper than the heading, until the next heading.
+_DESCRIBE_ENV_HEADING_RE = re.compile(r"^(\s*)Environment(?: Variables from)?:\s*$")
+_DESCRIBE_ENV_LINE_RE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_.\-]*):(\s+)(\S.*)$")
+
+
+def scrub_describe_environment(text: str) -> str:
+    """Mask the values in every `Environment:` block of `kubectl describe` output.
+
+    Indentation is the structure: a block runs from the heading until the first line
+    indented at or above the heading's level. Names survive; `<set to the key …>`
+    references survive too (they name a Secret key, not its value).
+    """
+    if not text:
+        return text
+    out: list[str] = []
+    block_indent: int | None = None
+    for line in text.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        if block_indent is not None:
+            indent = len(stripped) - len(stripped.lstrip(" "))
+            if stripped.strip() and indent <= block_indent:
+                block_indent = None
+            else:
+                m = _DESCRIBE_ENV_LINE_RE.match(stripped)
+                if m and not m.group(4).startswith("<"):
+                    line = f"{m.group(1)}{m.group(2)}:{m.group(3)}{MASK}" + line[len(stripped) :]
+                out.append(line)
+                continue
+        heading = _DESCRIBE_ENV_HEADING_RE.match(stripped)
+        if heading:
+            block_indent = len(heading.group(1))
+        out.append(line)
+    return "".join(out)
 
 
 # --------------------------------------------------------------------------------------

@@ -40,7 +40,7 @@ from .config import (
 from .console import console, status_mark, status_table
 from .install import adapters as ad
 from .ssh import SSHError, SSHPool
-from .validator import Rejected, render, validate
+from .validator import BUILTIN_DENY_PATHS, Rejected, render, validate
 from .versioning import fingerprint
 
 OK = "ok"
@@ -341,27 +341,10 @@ def _authorized_key_markers() -> list[str]:
     return markers
 
 
-#: Paths the agent may never name, in any command, on any host. Enforced against every
-#: argument token rather than only positionals — a path can arrive as a flag value too.
-DEFAULT_DENY_PATHS = [
-    "*.env",
-    "*.env.*",
-    ".env*",
-    "*.envrc",
-    "*/secrets/*",
-    "*/.ssh/*",
-    "*.pem",
-    "*.key",
-    "*.p12",
-    "*.pfx",
-    "id_rsa*",
-    "id_ed25519*",
-    "id_ecdsa*",
-    "*credentials*",
-    "*.kubeconfig",
-    "*/.aws/*",
-    "*/.docker/config.json",
-]
+#: The protected-path list is compiled into the shim (`validator.BUILTIN_DENY_PATHS`).
+#: It is written into the host policy as well only so an operator reading that file
+#: sees what is in force; the shim unions the two and can never end up with less.
+DEFAULT_DENY_PATHS = list(BUILTIN_DENY_PATHS)
 
 #: Where enrolment looks for .env files to learn variable names from.
 ENV_SCAN_ROOTS = ["/opt", "/srv", "/var/www", "/etc"]
@@ -778,6 +761,7 @@ def _enroll_hardened(
     settings: Settings | None,
     allow_exec: bool = False,
     exec_containers: list[str] | None = None,
+    exec_paths: list[str] | None = None,
 ) -> dict | None:
     """Create a dedicated unprivileged account and enrol against that, not your own.
 
@@ -840,6 +824,7 @@ def _enroll_hardened(
         "secret_digests": digests,
         "allow_exec": bool(allow_exec),
         "exec_containers": list(exec_containers or []),
+        "exec_path_prefixes": [p if p.endswith("/") else p + "/" for p in (exec_paths or [])],
         "exec_allow": sorted(EXEC_INNER_ALLOW),
         "docker_host": f"tcp://127.0.0.1:{proxy_port}" if proxy_ok else None,
         "env_allowlist": sorted(host_cfg.env_allowlist) if host_cfg else [],
@@ -1014,6 +999,18 @@ def cmd_enroll(args: argparse.Namespace) -> int:
         say(f"{BAD} name a host, or pass --all to enroll every reachable host")
         return 2
 
+    if args.allow_exec:
+        # Default-deny on both axes. "Any container, any path" is not a policy.
+        if not args.hardened:
+            say(f"{BAD} --allow-exec requires --hardened")
+            return 2
+        if not args.exec_container:
+            say(f"{BAD} --allow-exec needs at least one --exec-container NAME")
+            return 2
+        if not args.exec_path or not all(p.startswith("/") for p in args.exec_path):
+            say(f"{BAD} --allow-exec needs at least one absolute --exec-path PREFIX")
+            return 2
+
     chosen_names = _resolve_enroll_names(aliases, args)
 
     if args.hardened:
@@ -1048,6 +1045,7 @@ def cmd_enroll(args: argparse.Namespace) -> int:
                     settings,
                     args.allow_exec,
                     args.exec_container,
+                    args.exec_path,
                 )
             )
         ]
@@ -1951,7 +1949,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="NAME",
-        help="restrict --allow-exec to this container (repeatable; default: any)",
+        help="container --allow-exec may reach (repeatable; required with --allow-exec)",
+    )
+    p.add_argument(
+        "--exec-path",
+        action="append",
+        default=[],
+        metavar="PREFIX",
+        help="directory prefix cat/tail/head/grep may read inside a container, e.g. "
+        "/app/storage/logs/ (repeatable; required with --allow-exec)",
     )
     p.set_defaults(func=cmd_enroll)
 

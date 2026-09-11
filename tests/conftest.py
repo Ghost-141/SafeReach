@@ -18,8 +18,14 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from safereach.config import load_command_spec  # noqa: E402
+from safereach.validator import BUILTIN_DENY_PATHS, docker_host_deny_targets  # noqa: E402
 
-CURL_TARGETS = ["localhost", "127.0.0.1"]
+#: `host:port` entries; a bare host covers 80 and 443 only. 8000 is the app's health
+#: endpoint in the acceptance corpus.
+CURL_TARGETS = ["localhost", "127.0.0.1", "localhost:8000"]
+#: The fixture host runs a Docker socket proxy here. Its port must be unreachable by
+#: curl however curl_targets is written.
+DOCKER_HOST = "tcp://127.0.0.1:2375"
 
 
 @pytest.fixture(scope="session")
@@ -29,7 +35,12 @@ def spec() -> dict:
 
 @pytest.fixture(scope="session")
 def ctx() -> dict:
-    return {"curl_targets": list(CURL_TARGETS)}
+    """Mirrors what both `server._host_ctx` and the shim's `_host_ctx` build."""
+    return {
+        "curl_targets": list(CURL_TARGETS),
+        "curl_deny_targets": docker_host_deny_targets(DOCKER_HOST),
+        "deny_paths": list(BUILTIN_DENY_PATHS),
+    }
 
 
 @pytest.fixture(scope="session")
@@ -192,6 +203,63 @@ CURL = [
     "curl http://169.254.169.254/latest/meta-data/",
 ]
 
+# Commands that ran and returned secrets in the 0.1.x review. Each was ACCEPTED then.
+SECRET_SURFACE = [
+    # a Go template reaches Config.Env in text form, past the JSON mask
+    "docker inspect --format {{.Config.Env}} app",
+    "docker inspect --format '{{json .Config.Env}}' app",
+    "docker inspect --format '{{json .}}' app",
+    "docker container inspect --format '{{.Config}}' app",
+    "docker image inspect --format '{{.Config.Env}}' nginx",
+    # build layers carry ENV/ARG values
+    "docker history --no-trunc nginx",
+    "docker history nginx",
+    "docker image history nginx",
+    # unit files carry Environment= and ExecStart=… --token …
+    "systemctl cat nginx",
+    "systemctl show-environment",
+    # full-format process listings carry every argv, including -pPASSWORD
+    "ps -ef",
+    "ps -eF",
+    "ps -el",
+    "ps aux",
+    "ps -eo pid,args",
+    "ps -eo args",
+    "ps -eo pid,cmd",
+    "ps -eo pid,command",
+    # the Docker API over curl bypasses every mask docker output gets
+    "curl http://127.0.0.1:2375/containers/app/json",
+    "curl http://127.0.0.1:2375/containers/app/archive?path=%2Fapp",
+    "curl http://127.0.0.1:2375/containers/app/export",
+    "curl http://localhost:2375/version",
+    "curl http://[::1]:2375/version",
+    # a bare hostname in curl_targets no longer means every loopback service
+    "curl http://localhost:9200/_all/_search",
+    "curl http://localhost:8500/v1/kv/?recurse=true",
+    "curl http://127.0.0.1:6379/",
+    # redirects pivot to unlisted hosts
+    "curl -L http://localhost/",
+    "curl --location http://localhost/",
+    "curl --location-trusted http://localhost/",
+    "curl --max-redirs 5 http://localhost/",
+    # kubectl abbreviations and describe of value-bearing resources
+    "kubectl get sa",
+    "kubectl get sa/default",
+    "kubectl describe sa default",
+    "kubectl describe configmap app-config",
+    "kubectl describe cm app-config",
+    # process and kernel views, and this tool's own policy, are never readable
+    "ls /proc/1/",
+    "stat /proc/1/environ",
+    "grep x /proc/1/environ",
+    "ls /etc/safereach/",
+    "stat /etc/safereach/config.json",
+    "stat /usr/local/bin/safereach-shim",
+    # home directories are not diagnostics
+    "du -d 5 -h /home/",
+    "du -sh /home/deploy",
+]
+
 MALFORMED = [
     "",
     "   ",
@@ -214,6 +282,7 @@ ATTACKS: list[tuple[str, str]] = [
     *[("resource-exhaustion", c) for c in RESOURCE_EXHAUSTION],
     *[("docker", c) for c in DOCKER],
     *[("curl", c) for c in CURL],
+    *[("secret-surface", c) for c in SECRET_SURFACE],
     *[("malformed", c) for c in MALFORMED],
 ]
 
@@ -236,7 +305,27 @@ ACCEPTS: list[tuple[str, list[str]]] = [
     ("df -h /var", ["df", "-h", "/var"]),
     ("free -h", ["free", "-h"]),
     ("uptime", ["uptime"]),
-    ("ps -ef", ["ps", "-e", "-f"]),
+    ("ps -e", ["ps", "-e"]),
+    (
+        "ps -e -o pid,user,%cpu,%mem,etime,comm --sort=pcpu",
+        ["ps", "-e", "-o", "pid,user,%cpu,%mem,etime,comm", "--sort", "pcpu"],
+    ),
+    ("kubectl get configmaps", ["kubectl", "get", "configmaps"]),
+    ("kubectl get cm", ["kubectl", "get", "cm"]),
+    (
+        "curl -I https://localhost/",
+        [
+            "curl",
+            "-I",
+            "https://localhost/",
+            "--silent",
+            "--show-error",
+            "--proto",
+            "=http,https",
+            "--max-time",
+            "15",
+        ],
+    ),
     ("ss -tlnp", ["ss", "-t", "-l", "-n", "-p"]),
     ("ip addr", ["ip", "addr"]),
     ("dmesg -T", ["dmesg", "-T"]),
@@ -266,8 +355,6 @@ ACCEPTS: list[tuple[str, list[str]]] = [
             "=http,https",
             "--max-time",
             "15",
-            "--max-redirs",
-            "3",
         ],
     ),
 ]
