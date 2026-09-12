@@ -9,19 +9,19 @@ many hosts in parallel — with the hands removed.
 The agent can investigate. It cannot change anything, read a secret, escape into a shell,
 or reach a host it wasn't granted.
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
-[![MCP](https://img.shields.io/badge/MCP-2026--07--28-green)](https://modelcontextprotocol.io)
-[![CI](https://github.com/Ghost-141/SafeReach/actions/workflows/ci.yml/badge.svg)](https://github.com/Ghost-141/SafeReach/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/safereach)](https://pypi.org/project/safereach/)
-[![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+[![Python](https://img.shields.io/pypi/pyversions/safereach)](https://pypi.org/project/safereach/)
+[![CI](https://github.com/Ghost-141/SafeReach/actions/workflows/ci.yml/badge.svg)](https://github.com/Ghost-141/SafeReach/actions/workflows/ci.yml)
+[![MCP server](https://img.shields.io/badge/MCP-server-green)](https://modelcontextprotocol.io)
+[![License](https://img.shields.io/pypi/l/safereach)](LICENSE)
 
 ---
 
 ## Quick start
 
 ```bash
-uvx safereach@0.3.0 enroll --all      # set up every server you can already ssh to
-uvx safereach@0.3.0 install           # register with your agents
+uvx safereach@0.4.0 enroll --all      # set up every server you can already ssh to
+uvx safereach@0.4.0 install           # register with your agents
 ```
 
 Two commands. **No sudo required, no config file to edit, nothing installed globally.**
@@ -87,7 +87,7 @@ mode, one container.
 ### Recommended — `uvx`, pinned
 
 ```bash
-uvx safereach@0.3.0 --help
+uvx safereach@0.4.0 --help
 ```
 
 Nothing installed globally, and it is the one launch form that works identically for every
@@ -103,7 +103,7 @@ recommended.
 ### Alternative — a persistent install
 
 ```bash
-uv tool install safereach==0.3.0
+uv tool install safereach==0.4.0
 ```
 
 To work from a checkout, see [CONTRIBUTING.md](CONTRIBUTING.md#development-setup).
@@ -254,7 +254,8 @@ safereach shim-update --all         # when the release changed the allowlist or 
 safereach enroll <host> --hardened  # when the release changed root-owned host state
 ```
 
-Coming from 0.1.1? Go straight to 0.3.0 and run all three. Until `shim-update` runs, a
+Coming from 0.1.1? Go straight to 0.4.0 and run all three. Coming from 0.3.0, only the
+first. Until `shim-update` runs, a
 host on the old rules is **refused**, with a message naming the fingerprints — a host
 quietly running an older, looser allowlist is the failure mode this tool exists to
 prevent. Enrolment is idempotent, so re-running it is always safe.

@@ -27,7 +27,7 @@ is invisible.
 The same registration everywhere, rendered per agent:
 
 ```json
-{ "command": "uvx", "args": ["safereach@0.3.0"] }
+{ "command": "uvx", "args": ["safereach@0.4.0"] }
 ```
 
 For file-based agents the entry is **merged** into the existing config: the file is read,
