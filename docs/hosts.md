@@ -93,6 +93,37 @@ host, so the left column cannot reach a production fleet by accident.
 needs no root. The forced command — the actual security boundary — costs nothing to
 install, so there is no reason to run without it.
 
+## Removing a host
+
+```bash
+safereach unenroll myserver --yes                         # host cleaned, entry dropped
+safereach unenroll myserver --yes --remove-user --purge-log
+safereach unenroll myserver --yes --local-only            # the host no longer exists
+safereach unenroll myserver --dry-run                     # show the scripts, run nothing
+```
+
+`unenroll` reverses enrolment in the order that keeps every intermediate state safe, then
+**proves the enrolled key no longer authenticates** before it drops the host from
+`hosts.yaml`. A host that still answers the key stays in the file, marked as a problem,
+so nothing is forgotten while it can still be reached.
+
+What comes out, as the connecting account: our line in `authorized_keys`, the user-local
+shim and policy. As root, when passwordless sudo works over the same route enrolment
+used: the sshd drop-in (removed, then `sshd -t`, then reload — never a reload of an
+invalid config), the sudoers entry, the Docker proxy with its socket, tmpfiles entry and
+TCP-fallback firewall rule, `/usr/local/bin/safereach-shim`, `/etc/safereach`, and the
+diag account's key line.
+
+Two things are **kept by default**, because removal is exactly when someone may want
+them: the diag account (`--remove-user` deletes it) and the host's append-only audit log
+(`--purge-log` deletes it; otherwise its append-only flag is cleared and it stays at
+`/var/log/safereach.jsonl`). The local key under `~/.config/safereach/keys` is shared by
+every host and is never removed.
+
+Reaching the host uses your own access, never the enrolled key — the enrolled key can
+only invoke the shim. `--via <ssh alias>` names the route explicitly; without it the
+command tries the host's own alias in `~/.ssh/config`, then `--admin-user@hostname`.
+
 ## Container inspection
 
 `docker logs` covers apps logging to stdout. When a framework writes to a file instead

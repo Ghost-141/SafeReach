@@ -110,6 +110,40 @@ To work from a checkout, see [CONTRIBUTING.md](CONTRIBUTING.md#development-setup
 
 ---
 
+## Connecting your agents
+
+```bash
+safereach install --list     # which agents are on this machine, and where each keeps its config
+safereach install            # register with every one of them
+safereach install cursor     # or name the ones you want
+```
+
+```
+Detected agents
+     Agent               Config
+────────────────────────────────────────────────────────────────────
+ok   Claude Code         via the `claude-code` CLI
+ok   Claude Desktop      ~/.config/Claude/claude_desktop_config.json
+ok   Codex CLI           ~/.codex/config.toml
+--   Cursor              ~/.cursor/mcp.json
+ok   VS Code / Copilot   via the `vscode` CLI
+--   Zed                 ~/.config/zed/settings.json
+```
+
+Detection is per user on this machine: a CLI on your `PATH` (Claude Code, VS Code) or the
+agent's config directory being present, even if it has never written a config. Claude
+Code and VS Code are registered through their own CLIs; every other agent gets one entry
+merged into its config file under the key that agent uses, with a timestamped backup
+taken first and **your other MCP servers left exactly as they were**. Re-running is
+idempotent. `safereach uninstall` removes only safereach's entry.
+
+The registered command is `uvx safereach@<this version>`, so agents keep launching the
+build you enrolled with until you upgrade on purpose. An agent that is installed but not
+detected — another user's, or a non-standard config path — can be named explicitly.
+Details and the full list of supported agents: [docs/agents.md](docs/agents.md).
+
+---
+
 ## Setting up hosts
 
 ### `enroll` — the default
@@ -176,8 +210,16 @@ Before pointing an agent at a host that matters:
 - [ ] Host audit log `/var/log/safereach.jsonl` shipped to wherever your other logs go
 - [ ] Re-enrolled one non-critical host first after any upgrade that says "re-enrol"
 
-Naming and renaming hosts, the comparison of the three enrolment modes, and reading logs
-inside containers: [docs/hosts.md](docs/hosts.md).
+Taking a host out again is one command, and it proves the key is dead before it forgets
+the host:
+
+```bash
+safereach unenroll myserver --yes          # keeps the diag account and the audit log
+safereach unenroll myserver --yes --remove-user --purge-log
+```
+
+Naming and renaming hosts, the comparison of the three enrolment modes, removing a host,
+and reading logs inside containers: [docs/hosts.md](docs/hosts.md).
 
 ---
 
@@ -239,7 +281,8 @@ Every message the tool can produce, and what to do about it:
 |---|---|
 | [SECURITY.md](SECURITY.md) | Threat model in full, the four secret-protection layers, non-destruction by construction, the hardened host footprint, and how to report a vulnerability |
 | [docs/architecture.md](docs/architecture.md) | Request lifecycle and defence-in-depth diagrams |
-| [docs/hosts.md](docs/hosts.md) | Listing hosts, naming and renaming, enrolment modes compared, container inspection |
+| [docs/agents.md](docs/agents.md) | Which agents are supported, how each is detected and registered, launchers, uninstalling |
+| [docs/hosts.md](docs/hosts.md) | Listing hosts, naming and renaming, enrolment modes compared, removing a host, container inspection |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptoms, causes, and the SSH config override |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup, the test layers, extending the allowlist, releasing |
 | [CHANGELOG.md](CHANGELOG.md) | What changed, and what to run on each host after upgrading |

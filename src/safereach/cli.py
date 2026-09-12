@@ -1549,6 +1549,332 @@ def _push_shim(alias: str) -> bool:
     return inst.returncode == 0
 
 
+# --------------------------------------------------------------------------------------
+# unenroll
+# --------------------------------------------------------------------------------------
+
+#: Runs as the account we connect with, no sudo. Reverses plain `enroll`: our key line
+#: out of this account's authorized_keys, the user-local shim and policy gone. Every step
+#: is idempotent, so running this on a host that was only ever hardened is harmless.
+UNENROLL_USER_SCRIPT = r"""set -eu
+if [ -f "$HOME/.ssh/authorized_keys" ]; then
+    cp "$HOME/.ssh/authorized_keys" "$HOME/.ssh/.ak.new"
+{strip}
+    mv "$HOME/.ssh/.ak.new" "$HOME/.ssh/authorized_keys"
+    chmod 600 "$HOME/.ssh/authorized_keys"
+fi
+rm -f "$HOME/.local/bin/safereach-shim"
+rm -rf "$HOME/.config/safereach-shim"
+[ "{purge_log}" = "1" ] && rm -f "$HOME/.safereach-shim.jsonl"
+echo "USER_CLEANUP=done"
+"""
+
+#: Runs as root. Reverses `enroll --hardened` and `provision`, in the order that keeps
+#: every intermediate state safe: the daemon-level restrictions go first only after the
+#: replacement config validates, the iptables rule goes before the account it names is
+#: deleted, and the audit log has its append-only flag cleared before anything touches
+#: it. The log itself is KEPT unless asked otherwise: it is the record of what the agent
+#: did on this host, and removal is exactly when someone may want to read it.
+UNENROLL_ROOT_SCRIPT = r"""set -eu
+DIAG_USER="{diag_user}"
+REMOVE_USER="{remove_user}"
+PURGE_LOG="{purge_log}"
+PROXY_PORT="{proxy_port}"
+
+# --- sshd drop-in: remove, validate, reload; never leave sshd unable to restart ----
+SSHD="absent"
+if [ -f /etc/ssh/sshd_config.d/zz-safereach-diag.conf ]; then
+    rm -f /etc/ssh/sshd_config.d/zz-safereach-diag.conf
+    if sshd -t 2>/dev/null; then
+        (systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null) \
+            && SSHD="removed" || SSHD="removed-not-reloaded"
+    else
+        SSHD="removed-config-invalid"
+    fi
+fi
+echo "SSHD=$SSHD"
+
+# --- sudoers ------------------------------------------------------------------------
+rm -f /etc/sudoers.d/safereach
+echo "SUDOERS=removed"
+
+# --- docker proxy, its socket, its tmpfiles entry, and the TCP-fallback firewall rule -
+if command -v docker >/dev/null 2>&1; then
+    docker rm -f safereach-docker-proxy >/dev/null 2>&1 && echo "PROXY=removed" || echo "PROXY=absent"
+else
+    echo "PROXY=no-docker"
+fi
+if command -v iptables >/dev/null 2>&1 && id -u "$DIAG_USER" >/dev/null 2>&1; then
+    while iptables -D OUTPUT -o lo -p tcp --dport "$PROXY_PORT" -m owner ! --uid-owner "$DIAG_USER" -j REJECT 2>/dev/null; do :; done
+fi
+rm -f /etc/tmpfiles.d/safereach.conf
+rm -rf /run/safereach
+
+# --- shim and policy ------------------------------------------------------------------
+rm -f /usr/local/bin/safereach-shim
+rm -rf /etc/safereach
+echo "SHIM=removed"
+
+# --- the key line in the diag account's authorized_keys --------------------------------
+if id -u "$DIAG_USER" >/dev/null 2>&1; then
+    HOME_DIR=$(getent passwd "$DIAG_USER" | cut -d: -f6)
+    if [ -f "$HOME_DIR/.ssh/authorized_keys" ]; then
+        cp "$HOME_DIR/.ssh/authorized_keys" "$HOME_DIR/.ssh/.ak.new"
+{strip}
+        mv "$HOME_DIR/.ssh/.ak.new" "$HOME_DIR/.ssh/authorized_keys"
+        chown "$DIAG_USER" "$HOME_DIR/.ssh/authorized_keys"; chmod 600 "$HOME_DIR/.ssh/authorized_keys"
+    fi
+    echo "KEY=removed"
+else
+    echo "KEY=no-such-user"
+fi
+
+# --- audit log: keep by default; it is the evidence --------------------------------
+if [ -f /var/log/safereach.jsonl ]; then
+    chattr -a /var/log/safereach.jsonl 2>/dev/null || true
+    if [ "$PURGE_LOG" = "1" ]; then rm -f /var/log/safereach.jsonl; echo "LOG=purged"; else echo "LOG=kept"; fi
+else
+    echo "LOG=absent"
+fi
+
+# --- the account, only when asked ---------------------------------------------------
+if [ "$REMOVE_USER" = "1" ] && id -u "$DIAG_USER" >/dev/null 2>&1; then
+    pkill -u "$DIAG_USER" 2>/dev/null || true
+    userdel -r "$DIAG_USER" 2>/dev/null || userdel "$DIAG_USER"
+    echo "USER=removed"
+else
+    echo "USER=kept"
+fi
+"""
+
+
+def _remove_host_entry(text: str, alias: str) -> str:
+    """Delete one top-level host block from hosts.yaml, leaving everything else as is.
+
+    Targeted text editing for the same reason `_rewrite_alias` is: a YAML round-trip
+    would discard the comments the file is full of. A block runs from the host's own
+    key line to the next line that is not indented deeper than it (the next host, or a
+    top-level key, or the end of the file).
+    """
+    lines = text.splitlines(keepends=True)
+    head = re.compile(rf"^  {re.escape(alias)}\s*:\s*$")
+    starts = [i for i, line in enumerate(lines) if head.match(line.rstrip("\n"))]
+    if len(starts) != 1:
+        raise RuntimeError(f"expected exactly one host entry named {alias!r}, found {len(starts)}")
+    start = starts[0]
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if line.strip() and not line.startswith("   ") and not line.startswith("\t"):
+            break
+        end += 1
+    # Trailing blank lines inside the block belong to it, not to the next host.
+    return "".join(lines[:start] + lines[end:])
+
+
+def _admin_ssh_argv(host: HostConfig, alias: str, args: argparse.Namespace) -> list[str]:
+    """How to reach the host with the operator's OWN access, for the cleanup itself.
+
+    The enrolled key cannot do this — it can only invoke the shim, which is the point —
+    so the route is the same one enrolment used: an ssh_config alias when one resolves
+    to this host, else admin@hostname.
+    """
+    from . import discovery
+
+    if args.via:
+        return [*ssh_command(), "-o", "BatchMode=yes", args.via]
+    if host.uses_ssh_config and host.ssh_config_host:
+        return [*ssh_command(), "-o", "BatchMode=yes", host.ssh_config_host]
+    resolved = discovery.resolve_alias(alias)
+    if resolved.status != "error" and resolved.hostname and resolved.hostname == host.hostname:
+        return [*ssh_command(), "-o", "BatchMode=yes", alias]
+    port = str(host.ssh_port(Settings().defaults))
+    return [*ssh_command(), "-o", "BatchMode=yes", "-p", port, f"{args.admin_user}@{host.hostname}"]
+
+
+def _enrolled_key_still_works(host: HostConfig, settings: Settings) -> bool:
+    """The check that decides whether the host may leave hosts.yaml."""
+    from . import discovery
+
+    key = host.expanded_key() or KEY_PATH
+    if host.uses_ssh_config and host.ssh_config_host:
+        resolved = discovery.resolve_alias(host.ssh_config_host)
+        target, port, user = resolved.hostname, resolved.port, resolved.user
+    else:
+        target, port, user = host.hostname, host.ssh_port(settings.defaults), host.user
+    if not target or not user:
+        return False
+    proc = subprocess.run(
+        [
+            "ssh",
+            "-F",
+            "/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            f"UserKnownHostsFile={host.expanded_known_hosts(settings.defaults)}",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ConnectTimeout=15",
+            "-i",
+            str(key),
+            "-p",
+            str(port),
+            f"{user}@{target}",
+            "@ping",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    return proc.returncode == 0
+
+
+def cmd_unenroll(args: argparse.Namespace) -> int:
+    """Take a host out: every root-owned piece on the host, the key line, then the config.
+
+    The order is deliberate. The host is cleaned first and the enrolled key is then
+    PROVED dead against it; only after that does the entry leave hosts.yaml. A host that
+    still answers the key stays in the file, marked, so nothing is forgotten while it can
+    still be reached.
+    """
+    try:
+        settings = load_settings(args.config)
+        host = settings.host(args.host)
+    except (FileNotFoundError, ValueError, KeyError) as exc:
+        say(f"{BAD} {exc}")
+        return 1
+    alias = host.alias
+
+    proxy_port = "2375"
+    if host.docker_host and host.docker_host.startswith("tcp://"):
+        proxy_port = host.docker_host.rsplit(":", 1)[-1].rstrip("/") or "2375"
+    strip_user = _strip_markers_sh('"$HOME/.ssh/.ak.new"')
+    strip_root = _strip_markers_sh('"$HOME_DIR/.ssh/.ak.new"')
+    user_script = UNENROLL_USER_SCRIPT.format(strip=strip_user, purge_log=int(args.purge_log))
+    root_script = UNENROLL_ROOT_SCRIPT.format(
+        diag_user=host.user or "diag",
+        remove_user=int(args.remove_user),
+        purge_log=int(args.purge_log),
+        proxy_port=proxy_port,
+        strip=strip_root,
+    )
+
+    say(f"About to unenrol {alias} ({host.hostname or host.ssh_config_host}):")
+    say("  - remove our key line from the account's authorized_keys")
+    say("  - remove the user-local shim and policy (plain enrol)")
+    say("  - as root, if sudo works: sshd drop-in, sudoers, docker proxy, /etc/safereach,")
+    say("    /usr/local/bin/safereach-shim, the diag account's key line (hardened enrol)")
+    say(
+        f"  - {'DELETE' if args.remove_user else 'keep'} the diag account "
+        f"({'--remove-user' if args.remove_user else 'pass --remove-user to delete it'})"
+    )
+    say(
+        f"  - {'purge' if args.purge_log else 'keep'} the host audit log "
+        f"({'--purge-log' if args.purge_log else 'pass --purge-log to delete it'})"
+    )
+    say("  - prove the enrolled key no longer works, then drop the entry from hosts.yaml")
+    say("")
+    if args.dry_run:
+        say("--- as the connecting account ---")
+        say(user_script)
+        say("--- as root ---")
+        say(root_script)
+        return 0
+    if not args.yes:
+        say("This modifies a remote host. Re-run with --yes to proceed (or --dry-run to inspect).")
+        return 1
+
+    if not args.local_only:
+        ssh_argv = _admin_ssh_argv(host, alias, args)
+        run = subprocess.run(
+            [*ssh_argv, "bash -s"], input=user_script, capture_output=True, text=True, check=False
+        )
+        if run.returncode != 0:
+            say(
+                f"{BAD} {alias}: could not reach the host as an administrator: "
+                f"{(run.stderr or run.stdout).strip()[-200:]}"
+            )
+            say("   If the host is gone for good, re-run with --local-only to drop the entry.")
+            return 1
+        say(f"{OK} {alias}: user-level cleanup done")
+
+        sudo_ok = (
+            subprocess.run(
+                [*ssh_argv, "sudo -n true"], capture_output=True, text=True, check=False
+            ).returncode
+            == 0
+        )
+        if sudo_ok:
+            run = subprocess.run(
+                [*ssh_argv, "sudo -n bash -s"],
+                input=root_script,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            info = dict(line.split("=", 1) for line in run.stdout.splitlines() if "=" in line)
+            if run.returncode != 0:
+                say(
+                    f"{BAD} {alias}: root cleanup failed: {(run.stderr or run.stdout).strip()[-300:]}"
+                )
+                return 1
+            say(
+                f"{OK} {alias}: root cleanup — sshd {info.get('SSHD')}, proxy {info.get('PROXY')}, "
+                f"shim {info.get('SHIM')}, key {info.get('KEY')}, log {info.get('LOG')}, "
+                f"account {info.get('USER')}"
+            )
+            if info.get("SSHD") == "removed-config-invalid":
+                say(
+                    f"{WARN} {alias}: sshd config did not validate after removing the drop-in; "
+                    "sshd was NOT reloaded. Check `sshd -t` on the host before its next restart."
+                )
+        else:
+            say(
+                f"{WARN} {alias}: no passwordless sudo via this route, so any hardened state "
+                "(diag account, /etc/safereach, proxy, sudoers, sshd drop-in) is still there. "
+                "Re-run with --via <admin alias> or --admin-user."
+            )
+
+        if _enrolled_key_still_works(host, settings):
+            say(
+                f"{BAD} {alias}: the enrolled key STILL authenticates. The host stays in "
+                "hosts.yaml until that is fixed — check the account's authorized_keys by hand."
+            )
+            return 1
+        say(f"{OK} {alias}: enrolled key refused — the host no longer answers to it")
+    else:
+        say(
+            f"{WARN} {alias}: --local-only — nothing on the host was touched; if it still "
+            "exists, the enrolled key remains authorised there"
+        )
+
+    path = settings.source_path
+    if path is None:
+        say(f"{BAD} no config file to rewrite")
+        return 1
+    try:
+        text = _remove_host_entry(path.read_text(encoding="utf-8"), alias)
+    except RuntimeError as exc:
+        say(f"{BAD} {exc}")
+        return 1
+    backup = path.with_suffix(path.suffix + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    shutil.copy2(path, backup)
+    path.write_text(text, encoding="utf-8")
+    AuditLog(settings.audit_path()).write(decision="unenrolled", host=alias, host_id=host.id)
+    say(f"{OK} removed {alias} from {path} (backup {backup.name})")
+    if len(settings.hosts) == 1:
+        say(
+            "   That was the last host. The local key under "
+            f"{KEY_DIR} is kept; delete it yourself if nothing else uses it."
+        )
+    return 0
+
+
 def _host_mode(host: HostConfig, settings: Settings) -> tuple[str, str]:
     """What the config alone can say about a host's security mode, and how to style it.
 
@@ -2002,6 +2328,7 @@ setting up servers
   discover                      show what is reachable, changing nothing
   provision                     create a dedicated unprivileged account on a host
   rename                        give a host a friendlier name (local, no re-enrol)
+  unenroll                      take a host out: remove everything enrolment installed
   shim-update                   redeploy the remote validator after a spec change
   shim-build                    write the remote validator to a file, no deploy
 
@@ -2031,6 +2358,7 @@ SUBCOMMAND_DESCRIPTIONS = {
     "uninstall": "Remove safereach's registration from your agents.\n\nRemoves only safereach's own entry; other MCP servers are untouched.",
     "enroll": "Set up hosts over the SSH access you already have. No sudo needed.\n\nGenerates a dedicated keypair, installs the remote validator, and pins the key\nto a forced command so it can invoke nothing else. Your existing\nauthorized_keys entries are left alone.\n\nAdd --hardened to also create an unprivileged account with read-only Docker\naccess (needs sudo on the target, once).",
     "discover": "Show which servers in ~/.ssh/config you can reach with your existing keys.\n\nRead-only: changes nothing locally or remotely. Useful before `enroll`.",
+    "unenroll": "Take a host out of safereach.\n\nRemoves everything enrolment installed — our key line, the shim and policy,\nand in hardened mode the sshd drop-in, sudoers entry, docker proxy and the\ndiag account's key — then PROVES the enrolled key no longer authenticates\nbefore dropping the host from hosts.yaml. The diag account and the host audit\nlog are kept unless --remove-user / --purge-log say otherwise: the log is the\nrecord of what the agent did, and removal is when someone may want it.",
     "rename": "Give a host a friendlier name than the one discovery produced.\n\nPurely local — the remote host never knew the name, so nothing needs\nre-enrolling. The stable id is preserved, so audit history stays joined.",
     "validate": "Check whether a command would be allowed, without connecting to anything.\n\nShows the exact string that would run, including flags safereach injects.\nUseful when extending config/commands.yaml.",
     "hosts": "List every configured host: alias, address, user, port, mode and description.\n\nReads hosts.yaml only — no network, works offline. The MCP tool `list_hosts`\ndeliberately hides addresses from the agent; this is the operator's view.\nAdd --json for a machine-readable list on stdout.",
@@ -2049,6 +2377,7 @@ COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
             ("discover", "show what is reachable, changing nothing"),
             ("provision", "create a dedicated unprivileged account on a host"),
             ("rename", "give a host a friendlier name (local, no re-enrol)"),
+            ("unenroll", "take a host out: remove everything enrolment installed"),
             ("shim-update", "redeploy the remote validator after a spec change"),
             ("shim-build", "write the remote validator to a file, no deploy"),
         ],
@@ -2252,6 +2581,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--interactive", action="store_true", help="walk every host")
     p.add_argument("--write-names", metavar="FILE", help="dump the current names for editing")
     p.set_defaults(func=cmd_rename)
+
+    p = sub.add_parser("unenroll", help="remove everything enrolment installed on a host")
+    p.add_argument("host", help="alias in hosts.yaml")
+    p.add_argument(
+        "--via", metavar="SSH_ALIAS", help="ssh_config alias with admin access to the host"
+    )
+    p.add_argument(
+        "--admin-user",
+        default=os.environ.get("USER", "root"),
+        help="account with sudo, used as admin@hostname when no alias resolves to the host",
+    )
+    p.add_argument("--remove-user", action="store_true", help="delete the diag account too")
+    p.add_argument("--purge-log", action="store_true", help="delete the host audit log too")
+    p.add_argument(
+        "--local-only",
+        action="store_true",
+        help="drop the hosts.yaml entry without touching the host",
+    )
+    p.add_argument("--yes", action="store_true", help="proceed without confirmation")
+    p.add_argument("--dry-run", action="store_true", help="print what would run")
+    p.set_defaults(func=cmd_unenroll)
 
     p = sub.add_parser("validate", help="check a command against the allowlist, offline")
     p.add_argument("command")
