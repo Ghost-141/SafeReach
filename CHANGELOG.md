@@ -4,7 +4,10 @@ All notable changes, newest first. Versions are PyPI releases; each is tagged `v
 Every entry says what a user has to do on upgrade, because a shim fingerprint change
 refuses every host until `safereach shim-update --all` runs.
 
-## Unreleased
+## 0.4.0 — operating a fleet: list hosts, unenrol hosts
+
+Upgrade with `uvx safereach@0.4.0 install`. The shim fingerprint is **unchanged**, so no
+`shim-update` and no re-enrolment: hosts keep working as they are.
 
 - New `safereach unenroll <host>`: takes a host out. Removes our key line, the shim and
   policy, and in hardened mode the sshd drop-in, sudoers entry, Docker proxy and the diag

@@ -1,6 +1,6 @@
 [project]
 name = "safereach"
-version = "0.3.0"
+version = "0.4.0"
 description = "Read-only remote diagnostics over SSH, exposed as an MCP server"
 readme = "README.md"
 requires-python = ">=3.11"
