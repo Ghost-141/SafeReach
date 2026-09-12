@@ -9,11 +9,11 @@ many hosts in parallel — with the hands removed.
 The agent can investigate. It cannot change anything, read a secret, escape into a shell,
 or reach a host it wasn't granted.
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
-[![MCP](https://img.shields.io/badge/MCP-2026--07--28-green)](https://modelcontextprotocol.io)
-[![CI](https://github.com/Ghost-141/SafeReach/actions/workflows/ci.yml/badge.svg)](https://github.com/Ghost-141/SafeReach/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/safereach)](https://pypi.org/project/safereach/)
-[![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+[![Python](https://img.shields.io/pypi/pyversions/safereach)](https://pypi.org/project/safereach/)
+[![CI](https://github.com/Ghost-141/SafeReach/actions/workflows/ci.yml/badge.svg)](https://github.com/Ghost-141/SafeReach/actions/workflows/ci.yml)
+[![MCP server](https://img.shields.io/badge/MCP-server-green)](https://modelcontextprotocol.io)
+[![License](https://img.shields.io/pypi/l/safereach)](LICENSE)
 
 ---
 
