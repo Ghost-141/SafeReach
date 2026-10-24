@@ -893,6 +893,18 @@ def _enroll_one(
         "elevated": {name: ELEVATED_RECIPES[name] for name in elevated},
     }
 
+    # Layer 3 — digests of the host's secret VALUES, so a password that turns up bare in
+    # an application log (no `KEY=`, no recognisable token shape) is still masked. Needs
+    # passwordless sudo to read every .env; without it plain mode keeps layers 1 and 2,
+    # as before. The key sits in a 0600 policy owned by this same account, which can
+    # already read the .env files the digests came from, so it exposes nothing new.
+    digest_key = secrets.token_hex(32)
+    digests = _discover_env_digests(alias, digest_key)
+    if digests:
+        conf["digest_key"] = digest_key
+        conf["secret_digests"] = digests
+        say(f"   {alias}: {len(digests)} secret value digests (values never left the host)")
+
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
         fh.write(json.dumps(conf, indent=2))
         conf_path = Path(fh.name)

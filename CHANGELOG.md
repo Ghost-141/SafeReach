@@ -4,12 +4,26 @@ All notable changes, newest first. Versions are PyPI releases; each is tagged `v
 Every entry says what a user has to do on upgrade, because a shim fingerprint change
 refuses every host until `safereach shim-update --all` runs.
 
-## Unreleased — reading the logs that matter
+## 0.5.0 — reading the logs that matter
 
-The shim fingerprint **changes** (validator, spec and shim all changed), so run
-`safereach shim-update --all` after upgrading; hosts are refused until it runs. To add
-`zgrep` to a host enrolled earlier, add it to that host's `allow` list in `hosts.yaml`
-and re-enrol it.
+The shim fingerprint **changes** (validator, spec and shim all changed), so every host
+needs the new shim; hosts are refused until they have it. Upgrade with:
+
+```bash
+uvx safereach@0.5.0 install                       # repoint the agents
+safereach enroll web-1 db-1 …                     # every host, in ONE command (plain)
+safereach enroll web-1 db-1 … --hardened          # or this, for hardened hosts
+```
+
+Re-enrolling installs the new shim and runs the new log-source scan. Name every host in
+the one `enroll` run: enrolment writes `hosts.yaml` from the hosts in that run.
+`shim-update --all` also installs the shim on hosts addressed as `admin@hostname`, but
+skips the scan. To use `zgrep` on a host enrolled earlier, add it to that host's `allow`
+list in `hosts.yaml`.
+
+Everything below was exercised against two live production hosts (a PM2/Node API host
+and a 20-container Docker host) before release: every log-read failure an agent had hit
+on them now succeeds or comes back with an actionable refusal.
 
 - **Log sources, found at enrolment.** `enroll` now scans each host for where its logs
   really are — well-known locations, files running processes hold open, PM2 log
@@ -44,6 +58,16 @@ and re-enrol it.
 - **Hints.** A unit with an empty journal, a restricted `dmesg`, and an unreadable file
   now come back with a `hint` naming the next step. A command killed by a signal says
   which one.
+- **Secret-value digests on plain hosts.** Plain enrolment now also learns HMAC digests
+  of the host's `.env` values (when passwordless sudo is available), so a password that
+  appears bare in an application log is masked — previously only `--hardened` had this.
+- **Protected paths.** Hidden directories can no longer be log paths (except
+  `~/.pm2/logs/`), and PM2's `dump.pm2*` and `module_conf.json` — which hold every PM2
+  app's environment — are on the built-in protected list. Found by the live test: the
+  scan had offered `~/.pm2/` as a log directory.
+- **Log output is cleaner.** Terminal colour codes are stripped; a container's stderr is
+  merged into its log in order (many services log only to stderr); hidden bookkeeping
+  files in a log directory are skipped by `read_logs`.
 
 ## 0.4.0 — operating a fleet: list hosts, unenrol hosts
 

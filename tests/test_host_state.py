@@ -12,6 +12,7 @@ used to undermine it.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -180,3 +181,55 @@ def test_ssh_config_override_reaches_every_ssh_and_scp_call(
     source = (Path(cli.__file__)).read_text(encoding="utf-8")
     assert '["ssh", ' not in source and '["scp", ' not in source
     assert source.count('"-F",\n                "/dev/null"') == 2  # the two enrolled-key probes
+
+
+def test_plain_enrolment_carries_secret_digests_when_sudo_allows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Layer 3 on plain hosts: a bare secret value in an app log is masked there too."""
+    key = tmp_path / "id"
+    Path(str(key) + ".pub").write_text("ssh-ed25519 AAAA test\n")
+    monkeypatch.setattr(cli, "KEY_PATH", key)
+    monkeypatch.setattr(cli, "_discover_env_keys", lambda alias: ["DB_PASSWORD"])
+    monkeypatch.setattr(cli, "_discover_env_digests", lambda alias, k: ["a" * 32, "b" * 32])
+    monkeypatch.setattr(cli, "_remote_tmpdir", lambda argv: "/tmp/safereach.x")
+
+    def fake_run(argv: list[str], **_: object) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(argv, 0, stdout="/home/app\n", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    captured: dict = {}
+
+    def fake_upload(scp_argv, target, shim, conf, upload_dir):  # noqa: ANN001, ANN202
+        captured.update(json.loads(Path(conf).read_text()))
+        return "stop here"
+
+    monkeypatch.setattr(cli, "_upload", fake_upload)
+    assert cli._enroll_one("web-1", tmp_path / "shim", "v", None) is None
+    assert captured["secret_digests"] == ["a" * 32, "b" * 32]
+    assert len(captured["digest_key"]) == 64
+    assert captured["secret_env_keys"] == ["DB_PASSWORD"]
+
+
+def test_plain_enrolment_without_sudo_has_no_digest_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = tmp_path / "id"
+    Path(str(key) + ".pub").write_text("ssh-ed25519 AAAA test\n")
+    monkeypatch.setattr(cli, "KEY_PATH", key)
+    monkeypatch.setattr(cli, "_discover_env_keys", lambda alias: [])
+    monkeypatch.setattr(cli, "_discover_env_digests", lambda alias, k: [])
+    monkeypatch.setattr(cli, "_remote_tmpdir", lambda argv: "/tmp/safereach.x")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda argv, **_: subprocess.CompletedProcess(argv, 0, stdout="/home/app\n", stderr=""),
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cli,
+        "_upload",
+        lambda *a: captured.update(json.loads(Path(a[3]).read_text())) or "stop here",
+    )
+    cli._enroll_one("web-1", tmp_path / "shim", "v", None)
+    assert "digest_key" not in captured and "secret_digests" not in captured
