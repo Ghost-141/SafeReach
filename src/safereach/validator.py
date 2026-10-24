@@ -222,6 +222,11 @@ BUILTIN_DENY_PATHS: tuple[str, ...] = (
     "*/.pgpass",
     "*.htpasswd",
     "*_history",
+    # PM2 keeps every managed app's full environment in dump.pm2 and module settings in
+    # module_conf.json, both beside its logs directory. Found on a live host: a scan
+    # offered ~/.pm2/ itself as a "log directory" because pm2.log lives there.
+    "*/.pm2/dump.pm2*",
+    "*/.pm2/module_conf.json",
     "/etc/shadow",
     "/etc/gshadow",
     "/etc/sudoers*",
@@ -490,6 +495,16 @@ def check_log_dir(path: str, deny_paths: list[str] | tuple[str, ...] = BUILTIN_D
     for tree in _FORBIDDEN_LOG_TREES:
         if norm.startswith(tree):
             raise Rejected(f"log path {norm!r} is under {tree}, which never holds readable logs")
+    # Dot-directories are tools' state and configuration — ~/.pm2 (dump.pm2 carries every
+    # app's environment), ~/.vscode-server, ~/.config — not application logs. The one
+    # exception is PM2's own logs directory, which is exactly where PM2 apps log.
+    hidden = [p for p in parts if p.startswith(".")]
+    if hidden and "/.pm2/logs/" not in norm:
+        raise Rejected(
+            f"log path {norm!r} is inside a hidden directory ({hidden[0]}), which holds tool "
+            "state and configuration rather than logs",
+            "for PM2 use ~/.pm2/logs/; otherwise name the application's own log directory",
+        )
     denied = _denied_path(norm, list(deny_paths)) or _denied_path(
         norm.rstrip("/"), list(deny_paths)
     )
@@ -617,7 +632,7 @@ def _check_positional(value: str, pspec: dict[str, Any], ctx: dict[str, Any]) ->
         # everywhere, and a host that runs a PM2 or Node app writing to
         # /opt/app/logs/ says so in its policy (enroll --log-path) instead of the agent
         # finding the files with `ls` and then being refused at `tail`.
-        prefixes += list(ctx.get(extra_key) or [])
+        prefixes += [p for p in ctx.get(extra_key) or [] if p not in prefixes]
     if prefixes:
         # Reject traversal before the prefix check, so ``/var/log/../../etc/shadow``
         # cannot satisfy the prefix and then climb out of it.

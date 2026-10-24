@@ -653,6 +653,8 @@ async def read_logs(
 
     - `grep`: a regular expression; only matching lines are returned. Alternation and
       anchors work (`"timeout|ECONNRESET"`, `"^ERROR"`). Use `[0-9]`, not `\\d`, for files.
+      Files are matched before terminal colour codes are removed, so match on message
+      text (`"Forbidden"`) rather than a coloured level word (`"warn:"`).
     - `since` / `until`: relative (`30m`, `2h`, `7d`) or a date (`2026-10-22`,
       `2026-10-22 14:05`). For file sources they choose which files are read by date.
     - `lines`: how many of the newest lines to return (1–2000, default 200).

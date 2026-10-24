@@ -197,13 +197,16 @@ def _dir_facts(path, deny):
         if not stat.S_ISREG(st.st_mode):
             continue
         total += st.st_size
-        files.append((st.st_mtime, name))
+        files.append((st.st_mtime, name, st.st_size))
     files.sort(reverse=True)
     facts.update(
         {
             "files": len(files),
             "bytes": total,
-            "names": [n for _, n in files[:MAX_NAMES_PER_DIR]],
+            "names": [f[1] for f in files[:MAX_NAMES_PER_DIR]],
+            # Per-file size and age, so a source that is one pattern inside a shared
+            # directory (auth.log* in /var/log) reports its own numbers, not the folder's.
+            "entries": [[f[1], f[2], f[0]] for f in files[:MAX_NAMES_PER_DIR]],
             "newest": files[0][1] if files else None,
             "newest_mtime": files[0][0] if files else None,
             "hazards": sorted(hazards)[:10],
@@ -215,7 +218,11 @@ def _dir_facts(path, deny):
 
 
 def _journal_empty(unit):
-    out = _run(["journalctl", "-u", unit, "-n", "1", "-q", "--no-pager"], timeout=3)
+    """No journal entries in the last day. All-time is the wrong question: a PM2 unit
+    logs its own start-up to the journal once, then the apps write only to files."""
+    out = _run(
+        ["journalctl", "-u", unit, "-n", "1", "-q", "--no-pager", "--since", "-24h"], timeout=3
+    )
     if out is None:
         return None
     return out.strip() == ""

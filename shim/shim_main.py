@@ -228,6 +228,7 @@ def run_argv(
     line_filter: re.Pattern[str] | None = None,
     last_lines: int | None = None,
     note: str | None = None,
+    merge_stderr: bool = False,
 ) -> int:
     """Execute a validated argv with no shell involved at all.
 
@@ -237,7 +238,9 @@ def run_argv(
 
     ``line_filter`` and ``last_lines`` exist for ``@logs``: a container's log has no grep
     flag of its own, so the match runs here, on both streams, before redaction. ``note``
-    is one line for stderr saying what was read.
+    is one line for stderr saying what was read. ``merge_stderr`` interleaves the two
+    streams in arrival order — `docker logs` replays a container's stderr on stderr, and
+    many services (Grafana Alloy, most Go and Python apps) log nowhere else.
     """
     timeout = int(cfg.get("command_timeout", DEFAULT_TIMEOUT))
     tail_first = keeps_tail(argv)
@@ -268,7 +271,7 @@ def run_argv(
         proc = subprocess.Popen(  # noqa: S603 - argv is validated and never shell-parsed
             [*wrapper, *argv],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
             env=env,
             stdin=subprocess.DEVNULL,
         )
@@ -278,10 +281,11 @@ def run_argv(
     # Both pipes are drained concurrently into bounded buffers. Collecting everything and
     # slicing afterwards — the old shape — held a chatty container's whole log in memory
     # and could only ever keep the start of it.
-    sinks: list[dict[str, Any]] = [{}, {}]
+    sinks: list[dict[str, Any]] = [{}, {"data": b"", "total": 0}]
+    pipes = [(proc.stdout, sinks[0])] + ([] if merge_stderr else [(proc.stderr, sinks[1])])
     readers = [
         threading.Thread(target=_drain, args=(pipe, max_bytes, tail_first, sink), daemon=True)
-        for pipe, sink in ((proc.stdout, sinks[0]), (proc.stderr, sinks[1]))
+        for pipe, sink in pipes
     ]
     for reader in readers:
         reader.start()
@@ -321,6 +325,10 @@ def run_argv(
     # which is precisely where a container's .env ends up.
     text_out = _seam(out.decode("utf-8", errors="replace"), out_total > max_bytes, tail_first)
     text_err = _seam(err.decode("utf-8", errors="replace"), err_total > max_bytes, tail_first)
+    # Terminal colour codes: PM2 and most Node loggers write them into the file. They
+    # cost the agent context and defeat a grep for `warn:`.
+    text_out = _ANSI_RE.sub("", text_out)
+    text_err = _ANSI_RE.sub("", text_err)
     if line_filter is not None:
         text_out = _keep_lines(text_out, line_filter, last_lines)
         text_err = _keep_lines(text_err, line_filter, last_lines)
@@ -377,6 +385,9 @@ def _drain(pipe: Any, limit: int, keep_tail: bool, sink: dict[str, Any]) -> None
         del buf[:-limit]
     sink["data"] = bytes(buf)
     sink["total"] = total
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 def _keep_lines(text: str, pattern: re.Pattern[str] | None, last: int | None) -> str:
@@ -528,7 +539,8 @@ def _source_files(source: dict[str, str], since: float | None, deny_paths: list[
     except OSError as exc:
         _die(EXIT_INTERNAL, f"safereach-shim: cannot list {directory}: {exc.strerror}")
     for name in names:
-        if not fnmatch.fnmatchcase(name, source["glob"]):
+        # Hidden files are a logger's bookkeeping (winston's rotation index), not logs.
+        if name.startswith(".") or not fnmatch.fnmatchcase(name, source["glob"]):
             continue
         path = directory + name
         if _denied_path(path, deny_paths):
@@ -643,6 +655,7 @@ def handle_logs(payload: str, cfg: dict[str, Any]) -> int:
         line_filter=line_filter,
         last_lines=lines,
         note=note,
+        merge_stderr=source["kind"] == "docker",
     )
 
 

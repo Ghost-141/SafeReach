@@ -27,7 +27,7 @@ from safereach import cli, logsources
 from safereach.config import HostConfig, load_settings
 from safereach.hostlogs import _parents
 from safereach.server import _describe_source
-from safereach.validator import Rejected, check_log_source, validate_argv
+from safereach.validator import Rejected, check_log_source, validate, validate_argv
 
 NOW = 1_800_000_000.0
 HOSTLOGS = Path(__file__).resolve().parent.parent / "src" / "safereach" / "hostlogs.py"
@@ -190,12 +190,53 @@ def test_candidates_cover_every_kind_of_location(facts: dict) -> None:
 def test_preselection_ticks_what_is_in_use(facts: dict) -> None:
     found = _by_name(logsources.build_candidates(facts)[0])
     ticked = {name for name, c in found.items() if c.selected}
-    assert {"syslog", "shop-api", "pm2-app", "nginx"} <= ticked
-    # Unticked: auth logs, a stale service log, an empty journal, containers.
+    # Running containers are the application on a container host.
+    assert {"syslog", "shop-api", "pm2-app", "nginx", "api", "worker"} <= ticked
+    # Unticked: auth logs, a stale service log, an empty journal.
     assert not found["auth"].selected
     assert not found["postgres"].selected
-    assert not found["api"].selected
     assert not [c for c in found.values() if c.spec.get("unit") == "pm2-app.service"][0].selected
+
+
+# The cases below were found by running the scan against live hosts.
+
+
+def test_pm2_home_and_editor_state_are_never_offered(facts: dict) -> None:
+    facts["open_logs"] += [
+        {"path": "/home/app/.pm2/pm2.log", "comm": "PM2 v5", "unit": "pm2-app.service"},
+        {"path": "/home/app/.vscode-server/cli/x.log", "comm": "code", "unit": None},
+    ]
+    candidates, skipped = logsources.build_candidates(facts)
+    dirs = {c.spec.get("dir") for c in candidates}
+    assert "/home/app/.pm2/" not in dirs
+    assert "/home/app/.vscode-server/cli/" not in dirs
+    assert any(".pm2" in s and "hidden directory" in s for s in skipped)
+
+
+def test_shared_directory_sources_report_their_own_size(facts: dict) -> None:
+    facts["dirs"]["/var/log/"]["entries"] = [
+        ["syslog", 20_000_000, NOW - 10],
+        ["auth.log", 3_000, NOW - 5 * 86400],
+        ["syslog.1", 1_000_000, NOW - 86400],
+    ]
+    found = _by_name(logsources.build_candidates(facts)[0])
+    assert "20.0 MB" in found["syslog"].detail or "20.1 MB" in found["syslog"].detail
+    assert "2.9 KB" in found["auth"].detail and "5d ago" in found["auth"].detail
+
+
+def test_system_units_and_our_proxy_are_not_sources(facts: dict) -> None:
+    facts["app_units"].append({"unit": "dbus.service", "comm": "dbus-daemon", "cwd": "/home/app"})
+    facts["containers"].append("safereach-docker-proxy")
+    found = logsources.build_candidates(facts)[0]
+    assert not [c for c in found if c.spec.get("unit") == "dbus.service"]
+    assert not [c for c in found if c.spec.get("container") == "safereach-docker-proxy"]
+
+
+def test_journal_of_a_service_with_log_files_is_not_preticked(facts: dict) -> None:
+    found = logsources.build_candidates(facts)[0]
+    nginx_journal = [c for c in found if c.spec.get("unit") == "nginx.service"]
+    assert nginx_journal and nginx_journal[0].name == "nginx-journal"
+    assert not nginx_journal[0].selected
 
 
 def test_directory_beside_a_secret_carries_a_warning(facts: dict) -> None:
@@ -242,7 +283,9 @@ def test_choose_toggles_adds_and_refuses(facts: dict) -> None:
     chosen = logsources.choose(
         "web-1", candidates, skipped, ask=lambda _q: next(answers), show=shown.append
     )
-    assert chosen["api"] == {"kind": "docker", "container": "api"}
+    # `api` was pre-ticked (a running container); its number toggled it off.
+    assert "api" not in chosen
+    assert chosen["worker"] == {"kind": "docker", "container": "worker"}
     assert chosen["worker-files"] == {
         "kind": "file",
         "dir": "/opt/shop/worker/logs/",
@@ -467,6 +510,33 @@ def test_logs_since_selects_files_by_date(
     assert "old" not in out and "new 1 ok" in out
 
 
+def test_logs_strips_terminal_colours(shim_path: Path, tmp_path: Path, source_dir: Path) -> None:
+    (source_dir / "app-2026-10-23.log").write_text(
+        "2026-10-23 \x1b[33m\x1b[3mwarn\x1b[23m\x1b[39m: [BOOKMARKS] Forbidden\n"
+    )
+    # grep runs over the raw file, so the pattern avoids the coloured word itself.
+    code, out, _ = _logs(shim_path, _policy(tmp_path, source_dir), source="app", grep="BOOKMARKS")
+    assert code == 0
+    assert out == "2026-10-23 warn: [BOOKMARKS] Forbidden"
+
+
+def test_logs_skips_hidden_bookkeeping_files(
+    shim_path: Path, tmp_path: Path, source_dir: Path
+) -> None:
+    (source_dir / ".abc-audit.json").write_text('{"hash": "deadbeef"}\n')
+    code, out, err = _logs(
+        shim_path, _policy(tmp_path, source_dir, glob="*"), source="app", grep="deadbeef"
+    )
+    assert "deadbeef" not in out
+    assert ".abc-audit.json" not in err
+
+
+def test_refusal_lists_each_permitted_prefix_once(spec: dict, ctx: dict) -> None:
+    with pytest.raises(Rejected) as exc:
+        validate("tail -n 5 /opt/x.log", spec, ctx={**ctx, "log_path_prefixes": ["/var/log/"]})
+    assert (exc.value.suggestion or "").count("/var/log/") == 1
+
+
 def test_logs_never_reads_a_secret_or_a_symlink_out(
     shim_path: Path, tmp_path: Path, source_dir: Path
 ) -> None:
@@ -576,8 +646,8 @@ def test_enrol_takes_preselected_sources_when_not_interactive(
 ) -> None:
     monkeypatch.setattr(logsources, "run_hostlogs", lambda *a, **k: (0, facts, ""))
     chosen = cli._choose_log_sources("web-1", ["ssh", "web-1"], {}, _args(), sudo=False)
-    assert {"syslog", "shop-api", "pm2-app", "nginx"} <= set(chosen)
-    assert "api" not in chosen
+    assert {"syslog", "shop-api", "pm2-app", "nginx", "api"} <= set(chosen)
+    assert "auth" not in chosen
 
 
 def test_enrol_accept_detected_takes_everything(

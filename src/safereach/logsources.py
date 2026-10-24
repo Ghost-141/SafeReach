@@ -19,6 +19,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -140,9 +141,35 @@ def _glob_for(names: list[str]) -> str:
 
 
 def _matching(facts: dict[str, Any], glob: str) -> bool:
-    from fnmatch import fnmatchcase
-
     return any(fnmatchcase(n, glob) for n in facts.get("names") or [])
+
+
+_OWN_CONTAINERS = frozenset({"safereach-docker-proxy"})
+
+#: Units that run in every Linux session or boot, never an application's log.
+_SYSTEM_UNIT_PREFIXES = ("systemd-", "user@", "session-", "getty@", "serial-getty@")
+_SYSTEM_UNITS = frozenset(
+    {
+        "dbus.service",
+        "cron.service",
+        "ssh.service",
+        "sshd.service",
+        "snapd.service",
+        "polkit.service",
+        "rsyslog.service",
+        "unattended-upgrades.service",
+        "multipathd.service",
+        "udisks2.service",
+        "packagekit.service",
+        "networkd-dispatcher.service",
+        "containerd.service",
+        "docker.service",
+    }
+)
+
+
+def _is_system_unit(unit: str) -> bool:
+    return unit in _SYSTEM_UNITS or unit.startswith(_SYSTEM_UNIT_PREFIXES)
 
 
 def build_candidates(
@@ -156,6 +183,8 @@ def build_candidates(
     skipped: list[str] = []
     taken: set[str] = set()
     covered: set[tuple[str, str]] = set()
+    #: Units whose log FILES are already candidates; their journal is then secondary.
+    file_units: set[str] = set()
 
     def add(
         name: str, raw: dict[str, str], detail: str, selected: bool, warning: str | None
@@ -176,9 +205,16 @@ def build_candidates(
             covered.add((spec["dir"], spec["glob"]))
         out.append(Candidate(name, spec, detail, selected, warning))
 
-    def file_detail(d: dict[str, Any], who: str = "") -> tuple[str, bool, str | None]:
-        recent = d.get("newest_mtime") is not None and now - d["newest_mtime"] < RECENT_S
-        parts = [p for p in (who, _age(now, d.get("newest_mtime")), _size(d.get("bytes", 0))) if p]
+    def file_detail(
+        d: dict[str, Any], who: str = "", glob: str | None = None
+    ) -> tuple[str, bool, str | None]:
+        newest, size = d.get("newest_mtime"), d.get("bytes", 0)
+        if glob and d.get("entries"):
+            mine = [e for e in d["entries"] if fnmatchcase(e[0], glob)]
+            newest = max((e[2] for e in mine), default=None)
+            size = sum(e[1] for e in mine)
+        recent = newest is not None and now - newest < RECENT_S
+        parts = [p for p in (who, _age(now, newest), _size(size)) if p]
         warning = None
         if d.get("hazards"):
             warning = f"directory also holds {', '.join(d['hazards'][:3])} — never readable"
@@ -200,7 +236,8 @@ def build_candidates(
                 continue
             if (directory, entry.glob) in covered:
                 break
-            detail, recent, warning = file_detail(d)
+            detail, recent, warning = file_detail(d, glob=entry.glob)
+            file_units.update(entry.units)
             selected = not entry.never and (entry.always or recent)
             add(
                 entry.name,
@@ -240,7 +277,9 @@ def build_candidates(
         who = " ".join(
             x for x in (log.get("comm"), f"({log['unit']})" if log.get("unit") else "") if x
         )
-        detail, recent, warning = file_detail(d, who)
+        detail, recent, warning = file_detail(d, who, glob)
+        if log.get("unit"):
+            file_units.add(log["unit"])
         add(name, {"kind": "file", "dir": directory, "glob": glob}, detail, recent, warning)
 
     # Services: application units, and catalogue services that also log to journald.
@@ -253,22 +292,32 @@ def build_candidates(
         if u in (facts.get("running_units") or []) and u not in units
     ]
     for unit in units:
-        if any(c.spec.get("unit") == unit for c in out):
+        if _is_system_unit(unit) or any(c.spec.get("unit") == unit for c in out):
             continue
         is_empty = empty.get(unit)
-        detail = "empty — this service logs to files, not journald" if is_empty else "journald"
+        if is_empty:
+            detail = "no entries in 24h — this service logs to files, not journald"
+        elif unit in file_units:
+            detail = "journald (its log files are listed above)"
+        else:
+            detail = "journald"
+        base = _slug(unit.removesuffix(".service"))
+        # Pre-ticked only when the journal is the service's real log: not when it is
+        # quiet, and not when the same service's files are already on the list.
         add(
-            unit.removesuffix(".service"),
+            base if base not in taken else f"{base}-journal",
             {"kind": "journal", "unit": unit},
             detail,
-            is_empty is False,
+            is_empty is False and unit not in file_units,
             None,
         )
 
+    # Running containers ARE the application on a container host; pre-tick them. Our own
+    # Docker socket proxy is infrastructure and never a log source.
     for container in facts.get("containers") or []:
-        if any(c.spec.get("container") == container for c in out):
+        if container in _OWN_CONTAINERS or any(c.spec.get("container") == container for c in out):
             continue
-        add(container, {"kind": "docker", "container": container}, "docker logs", False, None)
+        add(container, {"kind": "docker", "container": container}, "docker logs", True, None)
 
     return out, skipped
 
