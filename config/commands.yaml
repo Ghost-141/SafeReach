@@ -283,6 +283,7 @@ grep:
     "-F": { alias: "--fixed-strings", value: none }
     "-r": { alias: "--recursive", value: none }
     "-v": { alias: "--invert-match", value: none }
+    "-h": { alias: "--no-filename", value: none }
     "-m": { alias: "--max-count", value: { type: int, min: 1, max: 2000 } }
     "-A": { alias: "--after-context", value: { type: int, min: 0, max: 20 } }
     "-B": { alias: "--before-context", value: { type: int, min: 0, max: 20 } }

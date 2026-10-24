@@ -14,7 +14,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from . import naming
-from .validator import Rejected, check_log_dir
+from .validator import Rejected, check_log_dir, check_log_source
 
 __all__ = [
     "HostConfig",
@@ -135,6 +135,13 @@ class HostConfig(BaseModel):
     #: (or told where to look) without a round trip.
     log_paths: list[str] = Field(default_factory=list)
 
+    #: Named log sources chosen at enrolment (`enroll` discovers candidates and offers a
+    #: checklist), read by the agent with `read_logs(source=…)`. Each is
+    #: ``{kind: file, dir, glob}``, ``{kind: docker, container}`` or
+    #: ``{kind: journal, unit}``; a file source's directory is also readable with tail
+    #: and grep. Mirrors the host's own policy, which is the authority.
+    log_sources: dict[str, dict[str, str]] = Field(default_factory=dict)
+
     docker_host: str | None = None
     env_allowlist: list[str] = Field(default_factory=list)
 
@@ -205,6 +212,25 @@ class HostConfig(BaseModel):
                 out.append(norm)
         return out
 
+    @field_validator("log_sources")
+    @classmethod
+    def _check_log_sources(cls, v: dict[str, Any]) -> dict[str, dict[str, str]]:
+        out: dict[str, dict[str, str]] = {}
+        for name, raw in v.items():
+            try:
+                out[name] = check_log_source(name, raw)
+            except Rejected as rej:
+                raise ValueError(rej.reason) from None
+        return out
+
+    def log_dirs(self) -> list[str]:
+        """Every directory tail/grep may read beyond /var/log: log_paths plus file sources."""
+        out = list(self.log_paths)
+        for source in self.log_sources.values():
+            if source["kind"] == "file" and source["dir"] not in out:
+                out.append(source["dir"])
+        return out
+
     @field_validator("known_hosts")
     @classmethod
     def _reject_disabled_host_keys(cls, v: str | None) -> str | None:
@@ -250,7 +276,8 @@ class HostConfig(BaseModel):
             "allowed_commands": sorted(self.allow),
             "elevated_recipes": sorted(self.elevated),
             "curl_targets": sorted(self.curl_targets),
-            "log_paths": list(self.log_paths),
+            "log_paths": self.log_dirs(),
+            "log_sources": {name: src["kind"] for name, src in sorted(self.log_sources.items())},
         }
 
 

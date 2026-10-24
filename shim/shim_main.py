@@ -29,11 +29,13 @@ result is a single stdlib-only file that can be scp'd anywhere.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -56,7 +58,9 @@ from safereach.validator import (  # noqa: E402
     BUILTIN_DENY_PATHS,
     TRUNCATION_TAG,
     Rejected,
+    _denied_path,
     check_log_dir,
+    check_log_source,
     docker_host_deny_targets,
     keeps_tail,
     render,
@@ -142,6 +146,25 @@ def _log_dirs(cfg: dict[str, Any], deny_paths: list[str]) -> list[str]:
             continue
         if norm not in out:
             out.append(norm)
+    # A file log source's directory is readable with tail/grep as well as read_logs:
+    # naming a source is how an operator says "the agent may read here".
+    for source in _log_sources(cfg, deny_paths).values():
+        if source["kind"] == "file" and source["dir"] not in out:
+            out.append(source["dir"])
+    return out
+
+
+def _log_sources(cfg: dict[str, Any], deny_paths: list[str]) -> dict[str, dict[str, str]]:
+    """The host's named log sources, each re-checked; an unsafe one is dropped and audited."""
+    out: dict[str, dict[str, str]] = {}
+    raw_sources = cfg.get("log_sources") or {}
+    if not isinstance(raw_sources, dict):
+        return out
+    for name, raw in raw_sources.items():
+        try:
+            out[name] = check_log_source(name, raw, deny_paths)
+        except Rejected as rej:
+            audit({"decision": "policy-ignored", "log_source": name, "reason": rej.reason})
     return out
 
 
@@ -198,12 +221,23 @@ def _resource_wrapper(path: str, timeout: int) -> list[str]:
     return wrapper
 
 
-def run_argv(argv: list[str], cfg: dict[str, Any]) -> int:
+def run_argv(
+    argv: list[str],
+    cfg: dict[str, Any],
+    *,
+    line_filter: re.Pattern[str] | None = None,
+    last_lines: int | None = None,
+    note: str | None = None,
+) -> int:
     """Execute a validated argv with no shell involved at all.
 
     ``subprocess`` with a list never goes through ``/bin/sh``, so there is no second
     parsing pass that could reinterpret a token. The re-quoting in the validator protects
     the SSH hop; this protects the final exec.
+
+    ``line_filter`` and ``last_lines`` exist for ``@logs``: a container's log has no grep
+    flag of its own, so the match runs here, on both streams, before redaction. ``note``
+    is one line for stderr saying what was read.
     """
     timeout = int(cfg.get("command_timeout", DEFAULT_TIMEOUT))
     tail_first = keeps_tail(argv)
@@ -287,6 +321,13 @@ def run_argv(argv: list[str], cfg: dict[str, Any]) -> int:
     # which is precisely where a container's .env ends up.
     text_out = _seam(out.decode("utf-8", errors="replace"), out_total > max_bytes, tail_first)
     text_err = _seam(err.decode("utf-8", errors="replace"), err_total > max_bytes, tail_first)
+    if line_filter is not None:
+        text_out = _keep_lines(text_out, line_filter, last_lines)
+        text_err = _keep_lines(text_err, line_filter, last_lines)
+    elif last_lines:
+        text_out = _keep_lines(text_out, None, last_lines)
+    if note:
+        text_err = f"{note}\n{text_err}"
     if _is_env_bearing(argv):
         text_out = redact_docker_inspect(text_out, cfg.get("env_allowlist") or [])
     # Structural scrubs, driven by the output's shape rather than by keywords: the
@@ -336,6 +377,15 @@ def _drain(pipe: Any, limit: int, keep_tail: bool, sink: dict[str, Any]) -> None
         del buf[:-limit]
     sink["data"] = bytes(buf)
     sink["total"] = total
+
+
+def _keep_lines(text: str, pattern: re.Pattern[str] | None, last: int | None) -> str:
+    lines = text.splitlines(keepends=True)
+    if pattern is not None:
+        lines = [line for line in lines if pattern.search(line)]
+    if last:
+        lines = lines[-last:]
+    return "".join(lines)
 
 
 def _seam(text: str, was_cut: bool, keep_tail: bool) -> str:
@@ -409,6 +459,191 @@ def _handle_run(payload: str, cfg: dict[str, Any]) -> int:
         audit({"decision": "error", "requested": argv, "error": repr(exc)})
         _die(EXIT_INTERNAL, f"safereach-shim: internal error during validation: {exc}")
     return run_argv(result.argv, cfg)
+
+
+# --------------------------------------------------------------------------------------
+# Named log sources — the agent names a source, the host decides what that means
+# --------------------------------------------------------------------------------------
+
+#: `30m`, `2h`, `7d` — or an absolute `2026-10-22` / `2026-10-22 14:05[:30]`.
+_RELATIVE_TIME_RE = re.compile(r"^([0-9]{1,4})([smhd])$")
+_ABSOLUTE_TIME_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}( [0-9]{2}:[0-9]{2}(:[0-9]{2})?)?$")
+_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+_LOGS_MAX_FILES = 3
+_LOGS_MAX_LINES = 2000
+
+
+def _logs_time(value: Any, field: str) -> tuple[str, float] | None:
+    """Validate a since/until value; return ``(spelling, epoch)`` or None when absent."""
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str):
+        _die(EXIT_REJECTED, f"Rejected: {field} must be a string")
+    rel = _RELATIVE_TIME_RE.match(value)
+    if rel:
+        return value, time.time() - int(rel.group(1)) * _UNIT_SECONDS[rel.group(2)]
+    if _ABSOLUTE_TIME_RE.match(value):
+        fmt = {10: "%Y-%m-%d", 16: "%Y-%m-%d %H:%M", 19: "%Y-%m-%d %H:%M:%S"}[len(value)]
+        try:
+            return value, time.mktime(time.strptime(value, fmt))
+        except ValueError:
+            pass
+    _die(
+        EXIT_REJECTED,
+        f"Rejected: {field} {value!r} must be relative (30m, 2h, 7d) or a date "
+        "(2026-10-22 or 2026-10-22 14:05)",
+    )
+    return None  # pragma: no cover - _die raises
+
+
+def _journal_time(spelling: str) -> str:
+    rel = _RELATIVE_TIME_RE.match(spelling)
+    if not rel:
+        return spelling
+    unit = {"s": "s", "m": "min", "h": "h", "d": "d"}[rel.group(2)]
+    return f"-{rel.group(1)}{unit}"
+
+
+def _docker_time(spelling: str) -> str:
+    rel = _RELATIVE_TIME_RE.match(spelling)
+    if not rel:
+        return spelling.replace(" ", "T")
+    n, unit = int(rel.group(1)), rel.group(2)
+    # Docker takes Go durations, which have no day unit.
+    return f"{n * 24}h" if unit == "d" else f"{n}{unit}"
+
+
+def _source_files(source: dict[str, str], since: float | None, deny_paths: list[str]) -> list[str]:
+    """The newest files a ``file`` source names, oldest first so output reads in order.
+
+    Every candidate is re-checked as a path in its own right: a regular file, not on the
+    protected list, and still inside the directory after resolving symlinks. The glob
+    picks names; it never widens what may be read.
+    """
+    directory = source["dir"]
+    real_dir = os.path.realpath(directory).rstrip("/") + "/"
+    found: list[tuple[float, str]] = []
+    try:
+        names = os.listdir(directory)
+    except OSError as exc:
+        _die(EXIT_INTERNAL, f"safereach-shim: cannot list {directory}: {exc.strerror}")
+    for name in names:
+        if not fnmatch.fnmatchcase(name, source["glob"]):
+            continue
+        path = directory + name
+        if _denied_path(path, deny_paths):
+            continue
+        real = os.path.realpath(path)
+        if not real.startswith(real_dir) or _denied_path(real, deny_paths):
+            continue
+        try:
+            st = os.stat(real)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        if since is not None and st.st_mtime < since:
+            continue
+        found.append((st.st_mtime, path))
+    found.sort()
+    return [path for _, path in found[-_LOGS_MAX_FILES:]]
+
+
+def handle_logs(payload: str, cfg: dict[str, Any]) -> int:
+    """Read one named log source: ``{"source", "grep"?, "since"?, "until"?, "lines"?}``.
+
+    The source name is looked up in THIS host's policy; the wire carries no path, no
+    container and no unit. What the name resolves to is turned into an ordinary argv —
+    `tail`, `grep`, `zgrep`, `docker logs` or `journalctl` — and that argv goes through
+    `validate_argv` against the embedded spec exactly like a command the agent typed, so
+    every rule that holds for `run_command` holds here too.
+    """
+    try:
+        request = json.loads(payload)
+    except (json.JSONDecodeError, ValueError) as exc:
+        _die(EXIT_REJECTED, f"Rejected: malformed @logs payload: {exc}")
+    if not isinstance(request, dict):
+        _die(EXIT_REJECTED, "Rejected: @logs payload must be an object")
+
+    ctx = _host_ctx(cfg)
+    sources = _log_sources(cfg, ctx["deny_paths"])
+    name = request.get("source")
+    if name not in sources:
+        available = ", ".join(sorted(sources)) or "(none configured)"
+        audit({"decision": "rejected", "log_source": name, "reason": "unknown source"})
+        _die(
+            EXIT_REJECTED,
+            f"Rejected: {name!r} is not a log source on this host\nAvailable: {available}",
+        )
+    source = sources[name]
+
+    lines = request.get("lines", 200)
+    if not isinstance(lines, int) or isinstance(lines, bool) or not 1 <= lines <= _LOGS_MAX_LINES:
+        _die(EXIT_REJECTED, f"Rejected: lines must be an integer from 1 to {_LOGS_MAX_LINES}")
+    pattern = request.get("grep")
+    compiled: re.Pattern[str] | None = None
+    if pattern not in (None, ""):
+        if not isinstance(pattern, str) or len(pattern) > 200 or "\n" in pattern:
+            _die(EXIT_REJECTED, "Rejected: grep must be a single-line pattern of at most 200 chars")
+        try:
+            compiled = re.compile(pattern)
+        except re.error as exc:
+            _die(EXIT_REJECTED, f"Rejected: grep is not a valid regular expression: {exc}")
+    else:
+        pattern = None
+    since = _logs_time(request.get("since"), "since")
+    until = _logs_time(request.get("until"), "until")
+
+    note = f"[safereach] log source {name!r} ({source['kind']})"
+    line_filter: re.Pattern[str] | None = None
+    if source["kind"] == "journal":
+        argv = ["journalctl", "-u", source["unit"], "-n", str(lines), "--no-pager"]
+        if since:
+            argv.append(f"--since={_journal_time(since[0])}")
+        if until:
+            argv.append(f"--until={_journal_time(until[0])}")
+        if pattern:
+            argv.append(f"--grep={pattern}")
+    elif source["kind"] == "docker":
+        # With a pattern, read a wider window and filter here: docker logs has no grep.
+        argv = ["docker", "logs", "--tail", str(_LOGS_MAX_LINES if pattern else lines)]
+        if since:
+            argv += ["--since", _docker_time(since[0])]
+        if until:
+            argv += ["--until", _docker_time(until[0])]
+        argv.append(source["container"])
+        line_filter = compiled
+    else:
+        files = _source_files(source, since[1] if since else None, ctx["deny_paths"])
+        if not files:
+            print(f"{note}: no files matching {source['glob']} in {source['dir']}", file=sys.stderr)
+            return 0
+        allow = cfg.get("allow")
+        if any(f.endswith(".gz") for f in files) and allow is not None and "zgrep" not in allow:
+            files = [f for f in files if not f.endswith(".gz")] or files
+        rotated = any(f.endswith(".gz") for f in files)
+        if pattern or rotated:
+            # zgrep reads plain files as well as .gz, so one argv covers a mixed set.
+            argv = ["zgrep" if rotated else "grep", "-h", "-E", pattern or "^", *files]
+        else:
+            argv = ["tail", "-q", "-n", str(lines), *files]
+        note += f": {', '.join(f.rsplit('/', 1)[-1] for f in files)}"
+        if until:
+            note += " (until filters which files are read only by date, not lines within them)"
+
+    try:
+        validated = validate_argv(argv, EMBEDDED_SPEC, allow=cfg.get("allow"), ctx=ctx)
+    except Rejected as rej:
+        audit({"decision": "rejected", "log_source": name, "requested": argv, "reason": rej.reason})
+        _die(EXIT_REJECTED, rej.render())
+    audit({"decision": "logs", "log_source": name, "argv": validated.argv})
+    return run_argv(
+        validated.argv,
+        cfg,
+        line_filter=line_filter,
+        last_lines=lines,
+        note=note,
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -646,6 +881,8 @@ def main(argv: list[str] | None = None) -> int:
             return _handle_run(requested[1:].partition(" ")[2], cfg)
         if verb == "exec":
             return handle_exec(requested[1:].partition(" ")[2], cfg)
+        if verb == "logs":
+            return handle_logs(requested[1:].partition(" ")[2], cfg)
         if verb == "check":
             # Validate without executing. The command arrives on stdin rather than as an
             # argument so it is not parsed twice — re-splitting it here would mangle the

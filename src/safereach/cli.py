@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import __version__, naming, shimbuild
+from . import __version__, logsources, naming, shimbuild
 from .audit import AuditLog
 from .config import (
     DEFAULT_CONFIG_PATH,
@@ -710,18 +710,117 @@ def _upload(
     return None
 
 
-def _existing_log_paths(settings: Settings | None, alias: str) -> list[str]:
-    """Log directories hosts.yaml already records for ``alias``, so re-enrolling keeps them.
+def _existing_host(settings: Settings | None, alias: str) -> HostConfig | None:
+    """The hosts.yaml entry for ``alias``, so re-enrolling keeps what it records.
 
     Matched by key or by ``ssh_config_host``: a host enrolled as `web-1` and then renamed
     `app` is still the same machine when `enroll web-1` runs again.
     """
     if settings is None:
-        return []
+        return None
     for key, host in settings.hosts.items():
         if alias in (key, host.ssh_config_host):
-            return list(host.log_paths)
-    return []
+            return host
+    return None
+
+
+def _existing_log_paths(settings: Settings | None, alias: str) -> list[str]:
+    host = _existing_host(settings, alias)
+    return list(host.log_paths) if host else []
+
+
+def _choose_log_sources(
+    alias: str,
+    ssh_argv: list[str],
+    existing: dict[str, dict[str, str]],
+    args: argparse.Namespace,
+    *,
+    sudo: bool,
+) -> dict[str, dict[str, str]]:
+    """Scan the host for log locations and let the operator pick; return the chosen set.
+
+    Never fatal: a host where the scan cannot run (no python3, no sudo for a hardened
+    scan) keeps the sources it already had plus any `--log-source`, with a warning.
+    """
+    if args.no_discover:
+        return dict(existing)
+    say(f"   {alias}: looking for log files, services and containers…")
+    code, facts, err = logsources.run_hostlogs(
+        ssh_argv, "discover", logsources.discovery_params(), sudo=sudo
+    )
+    if code != 0 or not facts or "dirs" not in facts:
+        say(
+            f"{WARN} {alias}: log scan did not run ({(err or f'exit {code}')[-120:]}); "
+            "keeping configured sources"
+        )
+        return dict(existing)
+    candidates, skipped = logsources.build_candidates(facts, existing)
+    if args.accept_detected:
+        for c in candidates:
+            c.selected = True
+    interactive = sys.stdin.isatty() and not args.no_prompt and not args.accept_detected
+    if interactive:
+        return logsources.choose(
+            alias, candidates, skipped, ask=lambda q: _ask(q), show=lambda s: say(s)
+        )
+    say(logsources.render_checklist(alias, candidates, skipped))
+    return {c.name: c.spec for c in candidates if c.selected}
+
+
+def _apply_log_policy(
+    alias: str,
+    ssh_argv: list[str],
+    sources: dict[str, dict[str, str]],
+    log_paths: list[str],
+    group: str | None = None,
+) -> bool:
+    """Write log policy into the host's own config and, when hardened, grant read access.
+
+    Tries without sudo first; ``hostlogs`` answers NEED_ROOT when the policy is the
+    root-owned one, and the same request is repeated under ``sudo -n``.
+    """
+    params: dict[str, Any] = {
+        "log_sources": sources,
+        "log_path_prefixes": log_paths,
+        "deny": list(BUILTIN_DENY_PATHS),
+    }
+    if group:
+        params["group"] = group
+    code, res, err = logsources.run_hostlogs(ssh_argv, "apply", params, sudo=False)
+    if code == 3:
+        code, res, err = logsources.run_hostlogs(ssh_argv, "apply", params, sudo=True)
+    if code != 0 or not res or not res.get("ok"):
+        detail = (res or {}).get("error") or err or f"exit {code}"
+        say(f"{BAD} {alias}: could not update the host's log policy: {detail[-200:]}")
+        return False
+    acl = res.get("acl")
+    if acl == "ok" and (res.get("granted") or res.get("revoked")):
+        if res.get("granted"):
+            say(f"{OK} {alias}: read access granted on {', '.join(res['granted'])}")
+        if res.get("revoked"):
+            say(f"{OK} {alias}: read access removed from {', '.join(res['revoked'])}")
+    elif acl in ("setfacl-missing", "partial"):
+        say(
+            f"{WARN} {alias}: could not grant read access on every log directory ({acl}); "
+            "install the `acl` package or grant the diag group read access by hand"
+        )
+    return True
+
+
+def _grant_log_access(alias: str, ssh_argv: list[str], conf: dict[str, Any], group: str) -> None:
+    if any(s.get("kind") == "file" for s in (conf.get("log_sources") or {}).values()):
+        _apply_log_policy(
+            alias, ssh_argv, conf["log_sources"], conf.get("log_path_prefixes") or [], group
+        )
+
+
+def _ask(question: str) -> str:
+    """One line from stdin, the question on stderr — stdout is never touched."""
+    print(question, end="", file=sys.stderr, flush=True)
+    try:
+        return input()
+    except EOFError:
+        return ""
 
 
 def _enroll_log_paths(
@@ -747,6 +846,7 @@ def _enroll_one(
     settings: Settings | None,
     elevated: list[str] | None = None,
     log_paths: list[str] | None = None,
+    log_sources: dict[str, dict[str, str]] | None = None,
 ) -> dict | None:
     """Install the shim and a restricted key on one host, over existing SSH access."""
     elevated = elevated or []
@@ -789,6 +889,7 @@ def _enroll_one(
         "max_output_bytes": 65536,
         "max_log_output_bytes": 131072,
         "log_path_prefixes": list(log_paths or []),
+        "log_sources": dict(log_sources or {}),
         "elevated": {name: ELEVATED_RECIPES[name] for name in elevated},
     }
 
@@ -944,6 +1045,7 @@ def _enroll_hardened(
     exec_containers: list[str] | None = None,
     exec_paths: list[str] | None = None,
     log_paths: list[str] | None = None,
+    log_sources: dict[str, dict[str, str]] | None = None,
 ) -> dict | None:
     """Create a dedicated unprivileged account and enrol against that, not your own.
 
@@ -1031,6 +1133,7 @@ def _enroll_hardened(
         "max_output_bytes": 65536,
         "max_log_output_bytes": 131072,
         "log_path_prefixes": list(log_paths or []),
+        "log_sources": dict(log_sources or {}),
         "elevated": {name: ELEVATED_RECIPES[name] for name in elevated},
     }
 
@@ -1119,6 +1222,7 @@ def _enroll_hardened(
         f"sudoers {info.get('SUDOERS', '?')}, sshd match {info.get('SSHD_MATCH', '?')}, "
         f"audit {info.get('AUDIT', '?')}, shim {info.get('SHIM')}"
     )
+    _grant_log_access(alias, [*ssh_command(), "-o", "BatchMode=yes", alias], conf, diag_user)
     return {
         "alias": alias,
         "hostname": resolved.hostname,
@@ -1219,8 +1323,28 @@ def cmd_enroll(args: argparse.Namespace) -> int:
         if rej.suggestion:
             say(f"   {rej.suggestion}")
         return 2
+    try:
+        cli_sources = dict(logsources.parse_source_arg(s) for s in args.log_source)
+    except Rejected as rej:
+        say(f"{BAD} --log-source: {rej.reason}")
+        return 2
 
     chosen_names = _resolve_enroll_names(aliases, args)
+
+    # Where this host's logs are, decided before anything is installed: the scan uses
+    # the same SSH access enrolment does, and the answer goes into the policy written
+    # below. A hardened scan runs under sudo so it sees every service's open files.
+    log_sources: dict[str, dict[str, dict[str, str]]] = {}
+    for alias in aliases:
+        prior = _existing_host(settings, alias)
+        existing = {**(prior.log_sources if prior else {}), **cli_sources}
+        log_sources[alias] = _choose_log_sources(
+            alias,
+            [*ssh_command(), "-o", "BatchMode=yes", alias],
+            existing,
+            args,
+            sudo=args.hardened,
+        )
 
     if args.hardened:
         say("Hardened enrolment. Uses sudo on the host to create a dedicated account.")
@@ -1256,6 +1380,7 @@ def cmd_enroll(args: argparse.Namespace) -> int:
                     args.exec_container,
                     args.exec_path,
                     log_paths[alias],
+                    log_sources[alias],
                 )
             )
         ]
@@ -1263,7 +1388,17 @@ def cmd_enroll(args: argparse.Namespace) -> int:
         enrolled = [
             r
             for alias in aliases
-            if (r := _enroll_one(alias, shim, expected, settings, args.elevated, log_paths[alias]))
+            if (
+                r := _enroll_one(
+                    alias,
+                    shim,
+                    expected,
+                    settings,
+                    args.elevated,
+                    log_paths[alias],
+                    log_sources[alias],
+                )
+            )
         ]
     if not enrolled:
         say(f"\n{BAD} nothing was enrolled")
@@ -1325,6 +1460,7 @@ def cmd_enroll(args: argparse.Namespace) -> int:
             "    curl_targets: [localhost, 127.0.0.1]",
             *([f"    elevated: [{', '.join(args.elevated)}]"] if args.elevated else []),
             *([f"    log_paths: [{', '.join(log_paths[alias])}]"] if log_paths.get(alias) else []),
+            *logsources.yaml_lines(log_sources.get(alias) or {}),
             "",
         ]
 
@@ -1498,7 +1634,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         host = settings.host(args.host)
         allow = host.allow or None
         ctx["curl_targets"] = list(host.curl_targets)
-        ctx["log_path_prefixes"] = list(host.log_paths)
+        ctx["log_path_prefixes"] = host.log_dirs()
 
     try:
         result = validate(args.command, spec, allow=allow, ctx=ctx)
@@ -1858,6 +1994,13 @@ def cmd_unenroll(args: argparse.Namespace) -> int:
             == 0
         )
         if sudo_ok:
+            # Read grants on application log directories go first, while the policy that
+            # records them still exists. A plain host has no root policy; nothing to do.
+            _, res, _ = logsources.run_hostlogs(
+                ssh_argv, "apply", {"log_sources": {}, "log_path_prefixes": []}, sudo=True
+            )
+            if res and res.get("revoked"):
+                say(f"{OK} {alias}: removed read access on {', '.join(res['revoked'])}")
             run = subprocess.run(
                 [*ssh_argv, "sudo -n bash -s"],
                 input=root_script,
@@ -2079,9 +2222,168 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             problems += 1
     console.print(table)
 
+    # Advice, not a problem: the host works, but the agent will be guessing at paths.
+    for host in settings.hosts.values():
+        if not host.log_sources:
+            say(
+                f"{WARN} {host.alias}: no log sources — the agent can read only /var/log and "
+                f"journald. Run `safereach logs scan {host.alias}`, then "
+                f"`safereach logs {host.alias} --check`."
+            )
+
     say("")
     say(f"{OK} no problems found" if not problems else f"{WARN} {problems} problem(s) above")
     return 1 if problems else 0
+
+
+# --------------------------------------------------------------------------------------
+# logs — the host's named log sources, after enrolment
+# --------------------------------------------------------------------------------------
+
+
+def _set_host_log_sources(text: str, key: str, sources: dict[str, dict[str, str]]) -> str:
+    """Replace one host's ``log_sources:`` block in hosts.yaml, leaving the rest as is.
+
+    Text-level, like `_remove_host_entry`, so the file's comments survive.
+    """
+    lines = text.splitlines(keepends=True)
+    head = re.compile(rf"^  {re.escape(key)}\s*:\s*$")
+    starts = [i for i, line in enumerate(lines) if head.match(line.rstrip("\n"))]
+    if len(starts) != 1:
+        raise RuntimeError(f"expected exactly one host entry named {key!r}, found {len(starts)}")
+    start = starts[0]
+    end = start + 1
+    while end < len(lines) and (
+        not lines[end].strip() or lines[end].startswith("   ") or lines[end].startswith("\t")
+    ):
+        end += 1
+    kept: list[str] = []
+    skipping = False
+    for line in lines[start + 1 : end]:
+        if line.startswith("    log_sources:"):
+            skipping = True
+            continue
+        if skipping and line.startswith("      "):
+            continue
+        skipping = False
+        kept.append(line)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    new_block = kept + [line + "\n" for line in logsources.yaml_lines(sources)] + ["\n"]
+    return "".join(lines[: start + 1] + new_block + lines[end:])
+
+
+def _scan_sources(
+    host: HostConfig, ssh_argv: list[str], args: argparse.Namespace
+) -> dict[str, dict[str, str]] | None:
+    params = logsources.discovery_params(root_if_hardened=True)
+    code, facts, err = logsources.run_hostlogs(ssh_argv, "discover", params, sudo=False)
+    if code == 3:
+        code, facts, err = logsources.run_hostlogs(ssh_argv, "discover", params, sudo=True)
+    if code != 0 or not facts or "dirs" not in facts:
+        say(f"{BAD} {host.alias}: log scan failed: {(err or f'exit {code}')[-200:]}")
+        return None
+    candidates, skipped = logsources.build_candidates(facts, host.log_sources)
+    if args.accept_detected:
+        for c in candidates:
+            c.selected = True
+    elif sys.stdin.isatty() and not args.no_prompt:
+        return logsources.choose(host.alias, candidates, skipped, ask=_ask, show=say)
+    say(logsources.render_checklist(host.alias, candidates, skipped))
+    return {c.name: c.spec for c in candidates if c.selected}
+
+
+async def _check_sources(settings: Settings, host: HostConfig) -> list[tuple[str, str, str]]:
+    """Read one line from each source through the real shim, as the agent would."""
+    pool = SSHPool(settings.defaults)
+    rows: list[tuple[str, str, str]] = []
+    try:
+        for name in sorted(host.log_sources):
+            wire = "@logs " + json.dumps({"source": name, "lines": 1})
+            try:
+                res = await pool.run(host, wire, log_output=True)
+            except SSHError as exc:
+                rows.append((BAD, name, str(exc)))
+                continue
+            first = (res.stderr.strip().splitlines() or [""])[0]
+            if res.exit_code not in (0, 1):
+                rows.append((BAD, name, first[-160:] or f"exit {res.exit_code}"))
+            elif not res.stdout.strip():
+                rows.append((WARN, name, "readable, but empty"))
+            else:
+                rows.append((OK, name, res.stdout.strip().splitlines()[-1][:100]))
+    finally:
+        await pool.close()
+    return rows
+
+
+_LOGS_ACTIONS = ("list", "scan", "add", "remove")
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    words = list(args.words)
+    action = words.pop(0) if words[0] in _LOGS_ACTIONS else "list"
+    if not words or len(words) > (2 if action in ("add", "remove") else 1):
+        say(f"{BAD} usage: safereach logs [{'|'.join(_LOGS_ACTIONS)}] HOST [SPEC]")
+        return 2
+    args.host, args.spec = words[0], (words[1] if len(words) > 1 else None)
+    if action in ("add", "remove") and not args.spec:
+        say(f"{BAD} logs {action} needs a {'NAME=SPEC' if action == 'add' else 'NAME'}")
+        return 2
+    try:
+        settings = load_settings(args.config)
+        host = settings.host(args.host)
+    except (FileNotFoundError, ValueError, KeyError) as exc:
+        say(f"{BAD} {exc}")
+        return 1
+
+    if action == "list":
+        if not host.log_sources and not host.log_paths:
+            say(f"{host.alias}: no log sources. Find some with `safereach logs scan {host.alias}`.")
+            return 0
+        width = max((len(n) for n in host.log_sources), default=4)
+        for name, spec in sorted(host.log_sources.items()):
+            say(
+                f"  {name:<{width}}  {spec['kind']:<7} {logsources.Candidate(name, spec, '').describe()}"
+            )
+        for path in host.log_paths:
+            say(f"  {'(path)':<{width}}  {'file':<7} {path} (tail/grep only)")
+        if args.check and host.log_sources:
+            say("")
+            for marker, name, detail in asyncio.run(_check_sources(settings, host)):
+                say(f"{marker} {name}: {detail}")
+        return 0
+
+    sources = dict(host.log_sources)
+    ssh_argv = _admin_ssh_argv(host, host.alias, args)
+    if action == "scan":
+        chosen = _scan_sources(host, ssh_argv, args)
+        if chosen is None:
+            return 1
+        sources = chosen
+    elif action == "add":
+        try:
+            name, spec = logsources.parse_source_arg(args.spec or "")
+        except Rejected as rej:
+            say(f"{BAD} {rej.reason}")
+            return 2
+        sources[name] = spec
+    elif action == "remove":
+        if args.spec not in sources:
+            say(f"{BAD} {host.alias} has no log source {args.spec!r}")
+            return 2
+        sources.pop(args.spec)
+
+    if sources == host.log_sources:
+        say(f"{OK} {host.alias}: log sources unchanged")
+        return 0
+    if not _apply_log_policy(host.alias, ssh_argv, sources, list(host.log_paths)):
+        return 1
+    path = settings.source_path or DEFAULT_CONFIG_PATH
+    key = next(k for k, h in settings.hosts.items() if h is host)
+    path.write_text(_set_host_log_sources(path.read_text(encoding="utf-8"), key, sources))
+    say(f"{OK} {host.alias}: {len(sources)} log source(s); hosts.yaml updated")
+    return 0
 
 
 # --------------------------------------------------------------------------------------
@@ -2199,6 +2501,7 @@ def _shim_config(host: HostConfig, settings: Settings) -> dict[str, Any]:
         "max_output_bytes": host.max_bytes(settings.defaults),
         "max_log_output_bytes": host.max_log_bytes(settings.defaults),
         "log_path_prefixes": list(host.log_paths),
+        "log_sources": dict(host.log_sources),
         "elevated": {
             name: ELEVATED_RECIPES[name] for name in host.elevated if name in ELEVATED_RECIPES
         },
@@ -2378,6 +2681,7 @@ setting up servers
   discover                      show what is reachable, changing nothing
   provision                     create a dedicated unprivileged account on a host
   rename                        give a host a friendlier name (local, no re-enrol)
+  logs                          a host's log sources: list, scan for more, add, remove
   unenroll                      take a host out: remove everything enrolment installed
   shim-update                   redeploy the remote validator after a spec change
   shim-build                    write the remote validator to a file, no deploy
@@ -2617,6 +2921,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="an application log directory on the host that tail/head/grep/zgrep may read "
         "in addition to /var/log, e.g. /opt/app/logs/ (repeatable; kept on re-enrolment)",
     )
+    p.add_argument(
+        "--log-source",
+        action="append",
+        default=[],
+        metavar="NAME=SPEC",
+        help="a named log source for read_logs: NAME=/dir/[:glob], NAME=docker:CONTAINER or "
+        "NAME=journal:UNIT (repeatable; kept on re-enrolment)",
+    )
+    p.add_argument(
+        "--no-discover",
+        action="store_true",
+        help="skip scanning the host for log files, services and containers",
+    )
+    p.add_argument(
+        "--accept-detected",
+        action="store_true",
+        help="take every log source the scan finds, without the checklist",
+    )
     p.set_defaults(func=cmd_enroll)
 
     p = sub.add_parser(
@@ -2660,6 +2982,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="proceed without confirmation")
     p.add_argument("--dry-run", action="store_true", help="print what would run")
     p.set_defaults(func=cmd_unenroll)
+
+    p = sub.add_parser(
+        "logs",
+        help="a host's named log sources: list, scan for more, add, remove",
+        description="safereach logs HOST [--check] | logs scan HOST | "
+        "logs add HOST NAME=SPEC | logs remove HOST NAME",
+    )
+    p.add_argument("words", nargs="+", metavar="[ACTION] HOST [SPEC]")
+    p.add_argument(
+        "--check", action="store_true", help="read one line from each source through the shim"
+    )
+    p.add_argument(
+        "--accept-detected", action="store_true", help="scan: take everything found, no checklist"
+    )
+    p.add_argument("--no-prompt", action="store_true", help="scan: take only pre-ticked items")
+    p.add_argument(
+        "--via", metavar="SSH_ALIAS", help="ssh_config alias with admin access to the host"
+    )
+    p.add_argument(
+        "--admin-user",
+        default=os.environ.get("USER", "root"),
+        help="account with sudo, used as admin@hostname when no alias resolves to the host",
+    )
+    p.set_defaults(func=cmd_logs)
 
     p = sub.add_parser("validate", help="check a command against the allowlist, offline")
     p.add_argument("command")

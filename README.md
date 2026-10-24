@@ -232,6 +232,7 @@ and reading logs inside containers: [docs/hosts.md](docs/hosts.md).
 | `describe_commands` | The allowlist in readable form — what may run, and how. |
 | `run_command` | Validate → execute → structured result. `host` is optional. |
 | `run_on_hosts` | Same, fanned out concurrently. The "who else is broken" tool. |
+| `read_logs` | Read a host's named log source (`api`, `nginx`, a container, a unit) with optional `grep`/`since`. No paths; newest lines last. |
 | `run_in_container` | Read-only commands **inside** a container, for logs not on stdout. |
 | `run_elevated` | One named recipe (e.g. `dmesg-recent`). A name, never a command line. |
 | `check_connectivity` | Reachability, auth, and the shim version handshake. |

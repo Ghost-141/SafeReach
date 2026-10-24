@@ -191,6 +191,7 @@ def test_initialize_advertises_all_tools(tmp_path: Path) -> None:
         "run_command",
         "run_on_hosts",
         "run_elevated",
+        "read_logs",
         "run_in_container",
         "check_connectivity",
     }, f"unexpected tool set: {tools}"

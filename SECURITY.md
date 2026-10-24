@@ -147,6 +147,27 @@ too. No TTY, no stdin, no interactive session.
 also permits container create/start at the API level. The command allowlist remains the
 control; the proxy no longer is. Leave it off unless you need it.
 
+## Log sources and application log directories
+
+`read_logs` takes a source **name**. The name is looked up in the host's own policy, turned
+into an ordinary argv (`tail`, `grep`, `zgrep`, `docker logs`, `journalctl`), and that argv
+is validated against the embedded spec exactly like a typed command — so `read_logs` can
+do nothing `run_command` could not. Nothing on the wire names a path, container or unit.
+
+Every log directory, whether from `--log-path` or a file source, passes one check on both
+sides (`validator.check_log_dir`): no broad roots (`/`, `/opt/`, `/home/<user>/`, …),
+nothing under `/etc`, `/proc`, `/sys` or container storage, nothing on the protected-path
+list. The shim re-checks its own policy and drops (and audits) an entry that fails. Inside
+a permitted directory the protected-path list still applies, and the shim re-tests every
+path **after resolving symlinks**, because an application's log directory is writable by
+the application: `logs/x.log -> ../.env` is refused.
+
+On hardened hosts, choosing a file source grants the diag group read access to that
+directory with POSIX ACLs, skipping files on the protected list; the grants are recorded
+in the policy and revoked by `logs remove` and `unenroll`. The enrolment-time scan that
+proposes sources runs as the operator (or root, for hardened), reads names, sizes and
+timestamps only, and never executes application tooling.
+
 ## Reporting a vulnerability
 
 **Do not open a public issue.** Use GitHub's private vulnerability reporting:

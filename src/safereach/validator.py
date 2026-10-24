@@ -38,6 +38,7 @@ __all__ = [
     "RESOURCE_ALIASES",
     "Rejected",
     "check_log_dir",
+    "check_log_source",
     "docker_host_deny_targets",
     "keeps_tail",
     "trim_output",
@@ -495,6 +496,55 @@ def check_log_dir(path: str, deny_paths: list[str] | tuple[str, ...] = BUILTIN_D
     if denied:
         raise Rejected(f"log path {norm!r} is on the protected-path list ({denied})")
     return norm
+
+
+#: A log source is addressed by name — `read_logs(source="api")` — so the agent never
+#: composes a path. Names are YAML keys and tool arguments, hence the narrow alphabet.
+LOG_SOURCE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,47}")
+_LOG_GLOB_RE = re.compile(r"[A-Za-z0-9._*\-]{1,64}")
+_CONTAINER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}")
+_UNIT_NAME_RE = re.compile(r"[A-Za-z0-9@._:\-]{1,128}")
+
+
+def check_log_source(
+    name: str, raw: Any, deny_paths: list[str] | tuple[str, ...] = BUILTIN_DENY_PATHS
+) -> dict[str, str]:
+    """Normalise one named log source, or raise :class:`Rejected`.
+
+    Three kinds, each pinned to what it may name:
+
+    * ``file`` — a directory (through :func:`check_log_dir`) and a basename glob. The glob
+      cannot contain ``/`` or ``**``, so it never reaches below or beside the directory.
+    * ``docker`` — a container name; read with ``docker logs``.
+    * ``journal`` — a systemd unit; read with ``journalctl -u``.
+
+    Shared by hosts.yaml loading, enrolment and the shim, which re-checks its own policy.
+    """
+    if not isinstance(name, str) or not LOG_SOURCE_NAME_RE.fullmatch(name):
+        raise Rejected(
+            f"log source name {name!r} must be lowercase letters, digits, '.', '_' or '-' "
+            "(at most 48 characters)"
+        )
+    if not isinstance(raw, dict):
+        raise Rejected(f"log source {name!r} must be a mapping with a 'kind'")
+    kind = raw.get("kind")
+    if kind == "file":
+        directory = check_log_dir(str(raw.get("dir", "")), deny_paths)
+        glob = str(raw.get("glob") or "*")
+        if not _LOG_GLOB_RE.fullmatch(glob) or "**" in glob:
+            raise Rejected(f"log source {name!r}: glob {glob!r} must be a plain file-name pattern")
+        return {"kind": "file", "dir": directory, "glob": glob}
+    if kind == "docker":
+        container = str(raw.get("container", ""))
+        if not _CONTAINER_NAME_RE.fullmatch(container):
+            raise Rejected(f"log source {name!r}: invalid container name {container!r}")
+        return {"kind": "docker", "container": container}
+    if kind == "journal":
+        unit = str(raw.get("unit", ""))
+        if not _UNIT_NAME_RE.fullmatch(unit) or unit.startswith("-"):
+            raise Rejected(f"log source {name!r}: invalid unit name {unit!r}")
+        return {"kind": "journal", "unit": unit}
+    raise Rejected(f"log source {name!r}: kind must be file, docker or journal (got {kind!r})")
 
 
 def _within(value: str, prefixes: list[str]) -> bool:

@@ -1,4 +1,4 @@
-"""The MCP server: seven tools over a validated SSH transport.
+"""The MCP server: nine tools over a validated SSH transport.
 
 Two SDK behaviours shape everything here, both changed in ``mcp`` v2:
 
@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shlex
 import sys
 from collections.abc import AsyncIterator
@@ -183,7 +184,7 @@ def _host_ctx(host: HostConfig) -> dict[str, Any]:
         "curl_targets": list(host.curl_targets),
         "curl_deny_targets": docker_host_deny_targets(host.docker_host),
         "deny_paths": list(BUILTIN_DENY_PATHS),
-        "log_path_prefixes": list(host.log_paths),
+        "log_path_prefixes": host.log_dirs(),
     }
 
 
@@ -386,12 +387,15 @@ def _hint(host: HostConfig, argv: list[str], result: ExecResult) -> str | None:
     binary = argv[0]
     out, err = result.stdout.strip(), result.stderr
     if binary == "journalctl" and "-u" in argv and out == "-- No entries --":
-        where = (
-            f"this host's application log directories: {', '.join(host.log_paths)}"
-            if host.log_paths
-            else "`docker logs <container>`, or ask the operator to register the app's "
-            "log directory with `safereach enroll <host> --log-path DIR`"
-        )
+        if host.log_sources:
+            where = f"`read_logs` with one of this host's sources: {', '.join(sorted(host.log_sources))}"
+        elif host.log_dirs():
+            where = f"this host's application log directories: {', '.join(host.log_dirs())}"
+        else:
+            where = (
+                "`docker logs <container>`, or ask the operator to run "
+                "`safereach logs scan <host>` to register the app's log location"
+            )
         return (
             "This unit wrote nothing to the journal in that window. Services run under "
             "PM2, supervisor or a container usually log to files instead — try " + where
@@ -474,6 +478,7 @@ def describe_commands(ctx: Context[AppContext], host: str | None = None) -> dict
     elevated: list[str] = []
     host_ctx: dict[str, Any] = {}
     log_paths: list[str] = []
+    log_sources: dict[str, str] = {}
     target = (
         host
         or app.selected_host
@@ -484,13 +489,17 @@ def describe_commands(ctx: Context[AppContext], host: str | None = None) -> dict
         allow = cfg.allow or None
         elevated = sorted(cfg.elevated)
         host_ctx = _host_ctx(cfg)
-        log_paths = list(cfg.log_paths)
+        log_paths = cfg.log_dirs()
+        log_sources = {name: _describe_source(src) for name, src in sorted(cfg.log_sources.items())}
 
     return {
         "commands": spec_summary(app.spec, allow, host_ctx),
         "elevated_recipes": elevated,
+        "log_sources": log_sources,
         "application_log_paths": log_paths,
         "rules": [
+            "To read an application's logs, prefer `read_logs(source=…)` with a name from "
+            "`log_sources`: no paths or flags to get right, newest lines last.",
             "One command per call. No pipes, redirects, subshells or ';' chaining.",
             "Only allowlisted binaries, and only their listed flags.",
             "File paths are restricted to the locations shown per command.",
@@ -611,6 +620,113 @@ async def run_elevated(
         stderr=redact_text(raw.stderr),
         truncated=raw.truncated,
         duration_ms=raw.duration_ms,
+    )
+
+
+def _describe_source(src: dict[str, str]) -> str:
+    if src["kind"] == "file":
+        return f"files {src['dir']}{src['glob']}"
+    if src["kind"] == "docker":
+        return f"container {src['container']}"
+    return f"journal unit {src['unit']}"
+
+
+_READ_LOGS_TIME_RE = re.compile(
+    r"^(?:[0-9]{1,4}[smhd]|[0-9]{4}-[0-9]{2}-[0-9]{2}(?: [0-9]{2}:[0-9]{2}(?::[0-9]{2})?)?)$"
+)
+
+
+@mcp.tool()
+async def read_logs(
+    ctx: Context[AppContext],
+    source: str,
+    grep: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    lines: int = 200,
+    host: str | None = None,
+) -> CommandResult:
+    """Read one of a host's named log sources — the easiest way to read application logs.
+
+    `source` is a name from `describe_commands` → `log_sources` (or `list_hosts`). The
+    host resolves it to its log files, container or systemd unit; you never pass a path.
+
+    - `grep`: a regular expression; only matching lines are returned. Alternation and
+      anchors work (`"timeout|ECONNRESET"`, `"^ERROR"`). Use `[0-9]`, not `\\d`, for files.
+    - `since` / `until`: relative (`30m`, `2h`, `7d`) or a date (`2026-10-22`,
+      `2026-10-22 14:05`). For file sources they choose which files are read by date.
+    - `lines`: how many of the newest lines to return (1–2000, default 200).
+
+    Output is in time order with the newest lines last; when `truncated` is true, narrow
+    with `since` or `grep`.
+    """
+    app = ctx.request_context.lifespan_context
+    cfg = await _resolve_host(app, ctx, host)
+    if source not in cfg.log_sources:
+        available = ", ".join(sorted(cfg.log_sources)) or "(none configured)"
+        raise ToolError(
+            f"{source!r} is not a log source on host {cfg.alias!r}. Available: {available}. "
+            "The operator adds sources with `safereach logs scan <host>`."
+        )
+    if not 1 <= lines <= 2000:
+        raise ToolError("lines must be between 1 and 2000")
+    if grep is not None and (len(grep) > 200 or "\n" in grep):
+        raise ToolError("grep must be a single-line pattern of at most 200 characters")
+    for field, value in (("since", since), ("until", until)):
+        if value is not None and not _READ_LOGS_TIME_RE.match(value):
+            raise ToolError(
+                f"{field} {value!r} must be relative (30m, 2h, 7d) or a date "
+                "(2026-10-22 or 2026-10-22 14:05)"
+            )
+
+    await _ensure_shim(app, cfg)
+    if not app.shim_versions.get(cfg.alias):
+        raise ToolError(
+            f"host {cfg.alias!r} has no safereach-shim, and log sources are resolved by the "
+            "shim on the host. Use run_command with tail/journalctl/docker logs instead."
+        )
+    request = {"source": source, "lines": lines}
+    request.update({k: v for k, v in (("grep", grep), ("since", since), ("until", until)) if v})
+    wire = "@logs " + json.dumps(request, separators=(",", ":"))
+    try:
+        raw = await app.pool.run(cfg, wire, log_output=True)
+    except SSHError as exc:
+        app.audit.error(host=cfg.alias, host_id=cfg.id, requested=wire, error=str(exc))
+        raise ToolError(str(exc)) from exc
+
+    if raw.exit_code == 92:
+        app.audit.rejected(
+            host=cfg.alias, host_id=cfg.id, requested=wire, reason=raw.stderr.strip()
+        )
+        raise ToolError(raw.stderr.strip() or "refused by the host")
+
+    app.audit.allowed(
+        host=cfg.alias,
+        host_id=cfg.id,
+        requested=f"read_logs {source}",
+        executed=wire,
+        exit_code=raw.exit_code,
+        duration_ms=raw.duration_ms,
+        bytes_out=len(raw.stdout),
+        truncated=raw.truncated,
+    )
+    stdout = redact_text(raw.stdout)
+    hint = None
+    if not stdout.strip():
+        hint = (
+            "No lines matched. Widen `since`, loosen `grep`, or check another source"
+            if grep or since
+            else "The source is empty. It may log somewhere else — check the other sources"
+        ) + f" ({', '.join(sorted(cfg.log_sources))})."
+    return CommandResult(
+        host=cfg.alias,
+        command=f"read_logs {source}",
+        exit_code=raw.exit_code,
+        stdout=stdout,
+        stderr=redact_text(raw.stderr),
+        truncated=raw.truncated,
+        duration_ms=raw.duration_ms,
+        hint=hint,
     )
 
 

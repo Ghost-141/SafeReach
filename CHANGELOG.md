@@ -11,6 +11,19 @@ The shim fingerprint **changes** (validator, spec and shim all changed), so run
 `zgrep` to a host enrolled earlier, add it to that host's `allow` list in `hosts.yaml`
 and re-enrol it.
 
+- **Log sources, found at enrolment.** `enroll` now scans each host for where its logs
+  really are — well-known locations, files running processes hold open, PM2 log
+  directories, units whose journal is empty, containers — and shows a checklist with
+  recently written sources pre-ticked. Chosen sources are named (`shop-api`, `nginx`,
+  `worker`) and stored in the host's policy and `hosts.yaml` as `log_sources`.
+  `--accept-detected`, `--no-discover` and `--log-source NAME=SPEC` cover scripted runs.
+  On `--hardened` hosts the diag group gets ACL read access to each chosen directory.
+- **New MCP tool `read_logs(source, grep, since, until, lines)`.** Reads a named source;
+  the host resolves the name, so the agent never composes a path. Listed in
+  `describe_commands` and `list_hosts`.
+- **New `safereach logs`**: `logs HOST [--check]`, `logs scan HOST`, `logs add HOST
+  NAME=SPEC`, `logs remove HOST NAME`. Updates the host's policy in place (and its ACLs),
+  then `hosts.yaml`. `doctor` points out hosts with no log sources.
 - **Application log directories.** `safereach enroll <host> --log-path DIR` (repeatable)
   lets `tail`, `head`, `grep`, `zgrep`, `ls` and `stat` read an app's own log directory
   as well as `/var/log`. The directory is checked on both sides (no broad roots, nothing

@@ -309,7 +309,17 @@ def test_empty_journal_points_at_the_application_log_directories() -> None:
 def test_empty_journal_without_log_paths_says_how_to_add_them() -> None:
     host = HostConfig(alias="a", ssh_config_host="a")
     hint = _hint(host, ["journalctl", "-u", "pm2-app"], _result("-- No entries --"))
-    assert hint and "--log-path" in hint
+    assert hint and "safereach logs scan" in hint
+
+
+def test_empty_journal_points_at_named_sources_first() -> None:
+    host = HostConfig(
+        alias="a",
+        ssh_config_host="a",
+        log_sources={"api": {"kind": "file", "dir": APP_LOGS, "glob": "*.log*"}},
+    )
+    hint = _hint(host, ["journalctl", "-u", "pm2-app"], _result("-- No entries --"))
+    assert hint and "read_logs" in hint and "api" in hint
 
 
 def test_restricted_dmesg_points_at_the_kernel_journal() -> None:
