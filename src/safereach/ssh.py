@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Any
 import asyncssh
 
 from .config import Defaults, HostConfig
+from .validator import TRUNCATION_TAG, trim_output
 
 __all__ = ["SSHPool", "ExecResult", "SSHError", "SHELL_ANSWERED", "unrestricted_key_message"]
 
@@ -178,16 +180,21 @@ class SSHPool:
         if conn is not None:
             conn.close()
 
-    async def run(self, host: HostConfig, command: str) -> ExecResult:
+    async def run(self, host: HostConfig, command: str, *, log_output: bool = False) -> ExecResult:
         """Execute one already-validated command string.
 
         The string goes to sshd, which — with the forced command installed — hands it to
         ``safereach-shim`` as ``$SSH_ORIGINAL_COMMAND`` rather than executing it. The same call
         works on a host without the shim, which is what makes incremental rollout
         possible.
+
+        ``log_output`` marks chronological output (see ``validator.keeps_tail``): it gets
+        the larger log budget, and an overflow keeps the newest lines, not the oldest.
         """
         timeout = host.timeout(self._defaults)
-        max_bytes = host.max_bytes(self._defaults)
+        max_bytes = (
+            host.max_log_bytes(self._defaults) if log_output else host.max_bytes(self._defaults)
+        )
 
         async with self._sem(host.alias):
             started = time.monotonic()
@@ -219,15 +226,32 @@ class SSHPool:
                 ) from exc
 
         duration_ms = int((time.monotonic() - started) * 1000)
-        stdout = _as_text(result.stdout)
-        stderr = _as_text(result.stderr)
-        truncated = len(stdout) > max_bytes or len(stderr) > max_bytes
+        stderr, host_cut = _take_truncation_tag(_as_text(result.stderr))
+        stdout, out_cut = trim_output(_as_text(result.stdout), max_bytes, log_output)
+        stderr, err_cut = trim_output(stderr, max_bytes, log_output)
+        omitted = (host_cut or 0) + out_cut + err_cut
+        notes: list[str] = []
+        if omitted:
+            where = "earlier" if log_output else "later"
+            notes.append(
+                f"[safereach] output truncated: {omitted} {where} bytes omitted"
+                + (" — narrow with --since/--until, -n, or --grep" if log_output else "")
+            )
+
+        # No exit status means the remote process ended on a signal. Saying which one is
+        # the difference between "the command failed" and "the command was killed".
+        exit_code = result.exit_status if result.exit_status is not None else -1
+        signal = getattr(result, "exit_signal", None)
+        if result.exit_status is None and signal:
+            notes.append(f"[safereach] remote process terminated by signal {signal[0]}")
+        if notes:
+            stderr = (stderr.rstrip("\n") + "\n" if stderr.strip() else "") + "\n".join(notes)
 
         return ExecResult(
-            exit_code=result.exit_status if result.exit_status is not None else -1,
-            stdout=stdout[:max_bytes],
-            stderr=stderr[:max_bytes],
-            truncated=truncated,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            truncated=bool(host_cut is not None or out_cut or err_cut),
             duration_ms=duration_ms,
         )
 
@@ -281,6 +305,23 @@ def _public_identity(key_path: Path) -> asyncssh.SSHKey | None:
     with contextlib.suppress(Exception):
         return asyncssh.read_private_key(str(key_path)).convert_to_public()
     return None
+
+
+def _take_truncation_tag(stderr: str) -> tuple[str, int | None]:
+    """Strip the shim's truncation tag; return ``(stderr, omitted_bytes or None)``."""
+    if TRUNCATION_TAG not in stderr:
+        return stderr, None
+    kept: list[str] = []
+    omitted: int | None = None
+    for line in stderr.splitlines():
+        if line.startswith(TRUNCATION_TAG):
+            try:
+                omitted = int(json.loads(line[len(TRUNCATION_TAG) :]).get("omitted_bytes", 0))
+            except (ValueError, AttributeError, TypeError):
+                omitted = 0
+            continue
+        kept.append(line)
+    return "\n".join(kept), omitted
 
 
 def _as_text(value: Any) -> str:

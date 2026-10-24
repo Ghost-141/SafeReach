@@ -124,6 +124,78 @@ Reaching the host uses your own access, never the enrolled key — the enrolled 
 only invoke the shim. `--via <ssh alias>` names the route explicitly; without it the
 command tries the host's own alias in `~/.ssh/config`, then `--admin-user@hostname`.
 
+## Log sources
+
+Enrolment looks for where each server's logs actually are and asks which ones the agent
+should read:
+
+```
+web-1 — log sources found
+   1 [x] syslog    file    /var/log/syslog*                 written 1m ago  48.0 MB
+   2 [x] shop-api  file    /opt/shop/api/logs/*.log*        node (pm2-app.service)  written 2m ago  1.2 GB
+   3 [x] pm2-app   file    /home/app/.pm2/logs/*.log*       pm2  written 2m ago  3.1 MB
+   4 [ ] pm2-app   journal pm2-app.service                  empty — this service logs to files, not journald
+   5 [x] nginx     file    /var/log/nginx/*.log*            written 1m ago  210.4 MB
+   6 [ ] api       docker  container api                    docker logs
+      skipped: /opt/: log path '/opt/' is too broad — it would expose far more than logs
+Toggle with numbers (e.g. `2 5`), add a directory with `a /path/to/logs/ [name]`, `n` to tick nothing, Enter to accept.
+```
+
+The scan runs on the host over your own SSH access (under `sudo` for `--hardened`). It
+combines a catalogue of well-known locations with what the host is doing right now: files
+running processes hold open, PM2's log directories, services whose journal is empty, and
+containers. It reports names, sizes and timestamps only — no file is opened for reading,
+no command line or environment is read, and `pm2` itself is never run. Anything written
+in the last 24 hours is pre-ticked.
+
+The ticked sources are written into the host's own policy and into `hosts.yaml` as
+`log_sources`. The agent reads them by name — `read_logs(source="shop-api",
+grep="timeout|ECONNRESET", since="2h")` — and the host resolves the name to files, a
+container or a unit; the agent never sends a path. A file source's directory is also
+readable with `tail` and `grep`. On `--hardened` hosts the diag group is granted read
+access to each chosen directory with POSIX ACLs (default ACLs too, so rotated files stay
+readable); `unenroll` and `logs remove` take the grants back.
+
+```bash
+safereach enroll web-1 --accept-detected          # take everything the scan finds
+safereach enroll web-1 --no-discover              # skip the scan
+safereach enroll web-1 --log-source api=/opt/shop/api/logs/:*.log* \
+                       --log-source worker=docker:worker
+
+safereach logs web-1 --check                      # list sources; read one line from each
+safereach logs scan web-1                         # rescan; new candidates, same checklist
+safereach logs add web-1 billing=journal:billing.service
+safereach logs remove web-1 billing
+```
+
+`safereach doctor` points out hosts with no log sources.
+
+## Application log directories
+
+`tail`, `head`, `grep`, `zgrep`, `ls` and `stat` read under `/var/log/` everywhere. An
+app run by PM2, supervisor or a plain `node app.js >> logs/app.log` writes somewhere
+else, and its systemd unit's journal is empty (`-- No entries --`). Name the directory at
+enrolment and the agent can read it too:
+
+```bash
+safereach enroll myserver --log-path /opt/app/logs/ --log-path /home/app/.pm2/logs/
+```
+
+The directories go into the host's own policy and into `hosts.yaml` as `log_paths`;
+re-enrolling keeps them, so `--log-path` only ever adds. The agent sees them in
+`describe_commands` as `application_log_paths`.
+
+Each directory must be a leaf where logs live. Broad roots (`/`, `/opt/`, `/srv/`,
+`/home/<user>/`, `/var/lib/`), anything under `/etc`, `/proc`, `/sys` or container storage,
+and anything on the protected-path list are refused, by the CLI and again by the shim
+reading its own policy. The protected-path list still applies inside the directory, so a
+`.env` that sits next to the logs stays unreadable. On the host every path is also
+checked after resolving symlinks: `logs/x.log -> ../.env` is refused.
+
+The account still needs read permission on the files. In plain mode it is your own
+account, which usually owns the app's logs already; in hardened mode grant the diag
+group read access to the directory.
+
 ## Container inspection
 
 `docker logs` covers apps logging to stdout. When a framework writes to a file instead

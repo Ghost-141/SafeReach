@@ -4,6 +4,71 @@ All notable changes, newest first. Versions are PyPI releases; each is tagged `v
 Every entry says what a user has to do on upgrade, because a shim fingerprint change
 refuses every host until `safereach shim-update --all` runs.
 
+## 0.5.0 — reading the logs that matter
+
+The shim fingerprint **changes** (validator, spec and shim all changed), so every host
+needs the new shim; hosts are refused until they have it. Upgrade with:
+
+```bash
+uvx safereach@0.5.0 install                       # repoint the agents
+safereach enroll web-1 db-1 …                     # every host, in ONE command (plain)
+safereach enroll web-1 db-1 … --hardened          # or this, for hardened hosts
+```
+
+Re-enrolling installs the new shim and runs the new log-source scan. Name every host in
+the one `enroll` run: enrolment writes `hosts.yaml` from the hosts in that run.
+`shim-update --all` also installs the shim on hosts addressed as `admin@hostname`, but
+skips the scan. To use `zgrep` on a host enrolled earlier, add it to that host's `allow`
+list in `hosts.yaml`.
+
+Everything below was exercised against two live production hosts (a PM2/Node API host
+and a 20-container Docker host) before release: every log-read failure an agent had hit
+on them now succeeds or comes back with an actionable refusal.
+
+- **Log sources, found at enrolment.** `enroll` now scans each host for where its logs
+  really are — well-known locations, files running processes hold open, PM2 log
+  directories, units whose journal is empty, containers — and shows a checklist with
+  recently written sources pre-ticked. Chosen sources are named (`shop-api`, `nginx`,
+  `worker`) and stored in the host's policy and `hosts.yaml` as `log_sources`.
+  `--accept-detected`, `--no-discover` and `--log-source NAME=SPEC` cover scripted runs.
+  On `--hardened` hosts the diag group gets ACL read access to each chosen directory.
+- **New MCP tool `read_logs(source, grep, since, until, lines)`.** Reads a named source;
+  the host resolves the name, so the agent never composes a path. Listed in
+  `describe_commands` and `list_hosts`.
+- **New `safereach logs`**: `logs HOST [--check]`, `logs scan HOST`, `logs add HOST
+  NAME=SPEC`, `logs remove HOST NAME`. Updates the host's policy in place (and its ACLs),
+  then `hosts.yaml`. `doctor` points out hosts with no log sources.
+- **Application log directories.** `safereach enroll <host> --log-path DIR` (repeatable)
+  lets `tail`, `head`, `grep`, `zgrep`, `ls` and `stat` read an app's own log directory
+  as well as `/var/log`. The directory is checked on both sides (no broad roots, nothing
+  under `/etc`, `/proc`, `/sys` or container storage, nothing on the protected-path list),
+  and the shim re-checks every path after resolving symlinks. Kept on re-enrolment;
+  listed to the agent by `describe_commands`.
+- **Long log output keeps the newest lines.** `journalctl`, `docker logs`, `kubectl logs`,
+  `tail`, `grep`, `zgrep` and `dmesg` overflow from the end, not the start, cut on a line
+  boundary, with a separate budget (`max_log_output_bytes`, default 128 KB). The shim
+  streams into bounded buffers instead of collecting everything, and tells the client
+  when it cut, so `truncated` is now true whenever anything was dropped.
+- **Regex in search patterns.** `| ( ) $ \` inside quotes are ordinary characters:
+  `grep -E "timeout|ECONNRESET"`, `journalctl --grep "^Error.*$"`. Unquoted, they are
+  refused exactly as before.
+- **New `zgrep`** for rotated `.gz` logs, in the same locations as `grep`.
+- **Fixes.** `ls /var/log` (no trailing slash) is accepted. `ps --sort=-rss` is no longer
+  accepted by the client and then refused by the shim.
+- **Hints.** A unit with an empty journal, a restricted `dmesg`, and an unreadable file
+  now come back with a `hint` naming the next step. A command killed by a signal says
+  which one.
+- **Secret-value digests on plain hosts.** Plain enrolment now also learns HMAC digests
+  of the host's `.env` values (when passwordless sudo is available), so a password that
+  appears bare in an application log is masked — previously only `--hardened` had this.
+- **Protected paths.** Hidden directories can no longer be log paths (except
+  `~/.pm2/logs/`), and PM2's `dump.pm2*` and `module_conf.json` — which hold every PM2
+  app's environment — are on the built-in protected list. Found by the live test: the
+  scan had offered `~/.pm2/` as a log directory.
+- **Log output is cleaner.** Terminal colour codes are stripped; a container's stderr is
+  merged into its log in order (many services log only to stderr); hidden bookkeeping
+  files in a log directory are skipped by `read_logs`.
+
 ## 0.4.0 — operating a fleet: list hosts, unenrol hosts
 
 Upgrade with `uvx safereach@0.4.0 install`. The shim fingerprint is **unchanged**, so no

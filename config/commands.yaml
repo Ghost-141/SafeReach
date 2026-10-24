@@ -31,7 +31,9 @@ journalctl:
     "-r": { alias: "--reverse", value: none }
     "--since": { value: { type: regex, pattern: '[A-Za-z0-9 :+\-]{1,32}' } }
     "--until": { value: { type: regex, pattern: '[A-Za-z0-9 :+\-]{1,32}' } }
-    "--grep": { value: { type: regex, pattern: '[^`$\\]{1,200}' } }
+    # A search pattern is data handed to journalctl's own regex engine, never a shell, so
+    # alternation, anchors and escapes are all fair game: `--grep "timeout|refused$"`.
+    "--grep": { value: { type: regex, pattern: '.{1,200}' } }
     "--output": { value: { type: enum, choices: [short, short-iso, short-precise, cat, json, json-pretty] } }
     "--no-pager": { value: none }
   positionals: { max: 0 }
@@ -236,34 +238,43 @@ ip:
 # Every path-taking binary is constrained by `path_prefixes`, and the validator rejects
 # any '..' segment before the prefix is tested — otherwise /var/log/../../etc/shadow
 # would satisfy the prefix and then climb straight out of it.
+#
+# `extra_path_prefixes_from: log_path_prefixes` ADDS the host's own application log
+# directories (`enroll --log-path /opt/app/logs/`) to /var/log. Applications under PM2,
+# supervisor or a plain `node app.js >> logs/` never touch journald or /var/log, so
+# without this the agent could `ls` their logs and not read one line of them. Each
+# directory passes validator.check_log_dir on both sides, and the shim re-checks every
+# path after resolving symlinks, because an app's log directory is the app's to write.
 
 tail:
-  description: Last lines of a log file
+  description: Last lines of a log file (/var/log, plus this host's application log directories)
   flags:
     "-n": { alias: "--lines", value: { type: int, min: 1, max: 2000 } }
     "-q": { alias: "--quiet", value: none }
     "-v": { alias: "--verbose", value: none }
   positionals:
     max: 3
-    pattern: '/var/log/[A-Za-z0-9._/\-]{1,200}'
+    pattern: '/[A-Za-z0-9._/\-]{1,200}'
     path_prefixes: ["/var/log/"]
+    extra_path_prefixes_from: log_path_prefixes
   deny_flags:
     "-f": "--follow streams forever and would hang the connection"
     "--follow": "streams forever and would hang the connection"
     "-F": "streams forever and would hang the connection"
 
 head:
-  description: First lines of a log file
+  description: First lines of a log file (/var/log, plus this host's application log directories)
   flags:
     "-n": { alias: "--lines", value: { type: int, min: 1, max: 2000 } }
     "-q": { alias: "--quiet", value: none }
   positionals:
     max: 3
-    pattern: '/var/log/[A-Za-z0-9._/\-]{1,200}'
+    pattern: '/[A-Za-z0-9._/\-]{1,200}'
     path_prefixes: ["/var/log/"]
+    extra_path_prefixes_from: log_path_prefixes
 
 grep:
-  description: Search within permitted log files
+  description: Search within permitted log files (/var/log, plus this host's application log directories)
   flags:
     "-i": { alias: "--ignore-case", value: none }
     "-n": { alias: "--line-number", value: none }
@@ -272,24 +283,57 @@ grep:
     "-F": { alias: "--fixed-strings", value: none }
     "-r": { alias: "--recursive", value: none }
     "-v": { alias: "--invert-match", value: none }
+    "-h": { alias: "--no-filename", value: none }
     "-m": { alias: "--max-count", value: { type: int, min: 1, max: 2000 } }
     "-A": { alias: "--after-context", value: { type: int, min: 0, max: 20 } }
     "-B": { alias: "--before-context", value: { type: int, min: 0, max: 20 } }
   positionals:
     # Position-aware: the first argument is the search pattern (free text), everything
-    # after it is a file path and must stay inside /var/log. A single flat rule loose
-    # enough for the pattern would also permit `grep root /etc/shadow`.
+    # after it is a file path and must stay inside the permitted log locations. A single
+    # flat rule loose enough for the pattern would also permit `grep root /etc/shadow`.
+    # The pattern is handed to grep as one argv element with no shell anywhere, so it
+    # may use the whole regex alphabet: `grep -E "timeout|ECONNRESET" …`, `"error$"`.
     max: 4
     specs:
-      - { pattern: '[^`$\\]{1,200}' }
+      - { pattern: '.{1,200}' }
     rest:
-      pattern: '/var/log/[A-Za-z0-9._/\-]{1,200}'
+      pattern: '/[A-Za-z0-9._/\-]{1,200}'
       path_prefixes: ["/var/log/"]
+      extra_path_prefixes_from: log_path_prefixes
   deny_flags:
     "-f": "--file reads the pattern list from an arbitrary file"
     "--file": "reads the pattern list from an arbitrary file"
     "--include-dir": "widens the search beyond permitted paths"
     "-d": "--directories=recurse can walk outside permitted paths"
+
+zgrep:
+  description: Search rotated, gzip-compressed log files (*.gz) in the permitted log locations
+  # zgrep is grep over `gzip -cdfq`. It is a shell script, which is why the file argument
+  # alphabet stays the narrow one below: the historical zgrep bug (CVE-2022-1271) needed
+  # a newline or quote in a FILE NAME, and neither can get past this pattern.
+  flags:
+    "-i": { alias: "--ignore-case", value: none }
+    "-n": { alias: "--line-number", value: none }
+    "-c": { alias: "--count", value: none }
+    "-E": { alias: "--extended-regexp", value: none }
+    "-F": { alias: "--fixed-strings", value: none }
+    "-v": { alias: "--invert-match", value: none }
+    "-h": { alias: "--no-filename", value: none }
+    "-m": { alias: "--max-count", value: { type: int, min: 1, max: 2000 } }
+    "-A": { alias: "--after-context", value: { type: int, min: 0, max: 20 } }
+    "-B": { alias: "--before-context", value: { type: int, min: 0, max: 20 } }
+  positionals:
+    max: 4
+    specs:
+      - { pattern: '.{1,200}' }
+    rest:
+      pattern: '/[A-Za-z0-9._/\-]{1,200}'
+      path_prefixes: ["/var/log/"]
+      extra_path_prefixes_from: log_path_prefixes
+  deny_flags:
+    "-f": "--file reads the pattern list from an arbitrary file"
+    "--file": "reads the pattern list from an arbitrary file"
+    "-r": "zgrep cannot recurse; name the .gz files"
 
 stat:
   description: File metadata — size, owner, modification time
@@ -300,6 +344,7 @@ stat:
     max: 4
     pattern: '/[A-Za-z0-9._/\-]{1,200}'
     path_prefixes: ["/var/log/", "/etc/systemd/", "/opt/", "/srv/", "/var/lib/"]
+    extra_path_prefixes_from: log_path_prefixes
 
 ls:
   description: Directory listing for permitted paths
@@ -314,6 +359,7 @@ ls:
     max: 2
     pattern: '/[A-Za-z0-9._/\-]{1,200}'
     path_prefixes: ["/var/log/", "/etc/systemd/", "/opt/", "/srv/", "/var/lib/"]
+    extra_path_prefixes_from: log_path_prefixes
 
 # ---------------------------------- containers ---------------------------------------
 #
