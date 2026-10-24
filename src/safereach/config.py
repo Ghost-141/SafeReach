@@ -14,6 +14,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from . import naming
+from .validator import Rejected, check_log_dir
 
 __all__ = [
     "HostConfig",
@@ -56,6 +57,10 @@ class Defaults(BaseModel):
     connect_timeout: int = 10
     command_timeout: int = 30
     max_output_bytes: int = 65536
+    #: Budget for chronological log output (journalctl, docker logs, tail, grep). Larger
+    #: than the general cap because a log window is the thing being investigated, and
+    #: kept from the END when it overflows — see validator.keeps_tail.
+    max_log_output_bytes: int = 131072
     known_hosts: str = "~/.ssh/known_hosts"
     audit_log: str = "~/.local/state/safereach/audit.jsonl"
 
@@ -121,7 +126,14 @@ class HostConfig(BaseModel):
     connect_timeout: int | None = None
     command_timeout: int | None = None
     max_output_bytes: int | None = None
+    max_log_output_bytes: int | None = None
     known_hosts: str | None = None
+
+    #: Application log directories on this host, added to /var/log for tail, head, grep,
+    #: zgrep, ls and stat. Written by `enroll --log-path`; the host's own policy file is
+    #: the authority and re-checks every entry, this copy only lets the agent be refused
+    #: (or told where to look) without a round trip.
+    log_paths: list[str] = Field(default_factory=list)
 
     docker_host: str | None = None
     env_allowlist: list[str] = Field(default_factory=list)
@@ -180,6 +192,19 @@ class HostConfig(BaseModel):
             return "hardened"
         return "client-only"
 
+    @field_validator("log_paths")
+    @classmethod
+    def _check_log_paths(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        for path in v:
+            try:
+                norm = check_log_dir(path)
+            except Rejected as rej:
+                raise ValueError(rej.reason) from None
+            if norm not in out:
+                out.append(norm)
+        return out
+
     @field_validator("known_hosts")
     @classmethod
     def _reject_disabled_host_keys(cls, v: str | None) -> str | None:
@@ -208,6 +233,9 @@ class HostConfig(BaseModel):
     def max_bytes(self, defaults: Defaults) -> int:
         return self.max_output_bytes or defaults.max_output_bytes
 
+    def max_log_bytes(self, defaults: Defaults) -> int:
+        return self.max_log_output_bytes or defaults.max_log_output_bytes
+
     def ssh_port(self, defaults: Defaults) -> int:
         return self.port or defaults.port
 
@@ -222,6 +250,7 @@ class HostConfig(BaseModel):
             "allowed_commands": sorted(self.allow),
             "elevated_recipes": sorted(self.elevated),
             "curl_targets": sorted(self.curl_targets),
+            "log_paths": list(self.log_paths),
         }
 
 

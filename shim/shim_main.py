@@ -36,6 +36,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -53,8 +54,11 @@ from safereach.redact import (  # noqa: E402
 )
 from safereach.validator import (  # noqa: E402
     BUILTIN_DENY_PATHS,
+    TRUNCATION_TAG,
     Rejected,
+    check_log_dir,
     docker_host_deny_targets,
+    keeps_tail,
     render,
     validate,
     validate_argv,
@@ -81,6 +85,7 @@ LOG_PATHS = (Path("/var/log/safereach.jsonl"), Path.home() / ".safereach-shim.js
 
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_BYTES = 65536
+DEFAULT_MAX_LOG_BYTES = 131072
 
 EXIT_REJECTED = 92
 EXIT_INTERNAL = 93
@@ -109,11 +114,35 @@ def _host_ctx(cfg: dict[str, Any]) -> dict[str, Any]:
     The Docker API port is derived from `docker_host` rather than listed: an operator
     who forgets to deny it, or who lists it on purpose, still cannot reach it with curl.
     """
+    deny_paths = [*BUILTIN_DENY_PATHS, *(cfg.get("deny_paths") or [])]
     return {
         "curl_targets": cfg.get("curl_targets") or [],
         "curl_deny_targets": docker_host_deny_targets(cfg.get("docker_host")),
-        "deny_paths": [*BUILTIN_DENY_PATHS, *(cfg.get("deny_paths") or [])],
+        "deny_paths": deny_paths,
+        "log_path_prefixes": _log_dirs(cfg, deny_paths),
+        # Only this side can see the filesystem, so only this side resolves symlinks.
+        "resolve_symlinks": True,
     }
+
+
+def _log_dirs(cfg: dict[str, Any], deny_paths: list[str]) -> list[str]:
+    """The host's application log directories, each re-checked here.
+
+    The policy file is root-owned in hardened mode, but "the host trusts nothing it did
+    not check itself" includes its own config: a hand-edited `"/"` or `"/opt/"` must not
+    quietly become a read-anything grant. An unsafe entry is dropped, not fatal — the
+    rest of the policy still applies — and the drop is audited so it is seen.
+    """
+    out: list[str] = []
+    for raw in cfg.get("log_path_prefixes") or []:
+        try:
+            norm = check_log_dir(raw, deny_paths)
+        except Rejected as rej:
+            audit({"decision": "policy-ignored", "log_path": raw, "reason": rej.reason})
+            continue
+        if norm not in out:
+            out.append(norm)
+    return out
 
 
 def audit(record: dict[str, Any]) -> None:
@@ -177,7 +206,12 @@ def run_argv(argv: list[str], cfg: dict[str, Any]) -> int:
     the SSH hop; this protects the final exec.
     """
     timeout = int(cfg.get("command_timeout", DEFAULT_TIMEOUT))
-    max_bytes = int(cfg.get("max_output_bytes", DEFAULT_MAX_BYTES))
+    tail_first = keeps_tail(argv)
+    max_bytes = int(
+        cfg.get("max_log_output_bytes", DEFAULT_MAX_LOG_BYTES)
+        if tail_first
+        else cfg.get("max_output_bytes", DEFAULT_MAX_BYTES)
+    )
 
     env = {
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -197,24 +231,40 @@ def run_argv(argv: list[str], cfg: dict[str, Any]) -> int:
 
     started = time.monotonic()
     try:
-        proc = subprocess.run(  # noqa: S603 - argv is validated and never shell-parsed
+        proc = subprocess.Popen(  # noqa: S603 - argv is validated and never shell-parsed
             [*wrapper, *argv],
-            capture_output=True,
-            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=env,
             stdin=subprocess.DEVNULL,
-            check=False,
         )
     except FileNotFoundError:
         _die(EXIT_INTERNAL, f"safereach-shim: {argv[0]!r} is not installed on this host")
+
+    # Both pipes are drained concurrently into bounded buffers. Collecting everything and
+    # slicing afterwards — the old shape — held a chatty container's whole log in memory
+    # and could only ever keep the start of it.
+    sinks: list[dict[str, Any]] = [{}, {}]
+    readers = [
+        threading.Thread(target=_drain, args=(pipe, max_bytes, tail_first, sink), daemon=True)
+        for pipe, sink in ((proc.stdout, sinks[0]), (proc.stderr, sinks[1]))
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
         audit({"decision": "timeout", "argv": argv, "timeout_s": timeout})
         _die(EXIT_INTERNAL, f"safereach-shim: command exceeded {timeout}s and was killed")
+    for reader in readers:
+        reader.join()
 
     duration_ms = int((time.monotonic() - started) * 1000)
-    out = proc.stdout[:max_bytes]
-    err = proc.stderr[:max_bytes]
-    truncated = len(proc.stdout) > max_bytes or len(proc.stderr) > max_bytes
+    out, out_total = sinks[0]["data"], sinks[0]["total"]
+    err, err_total = sinks[1]["data"], sinks[1]["total"]
+    truncated = out_total > max_bytes or err_total > max_bytes
 
     audit(
         {
@@ -223,8 +273,9 @@ def run_argv(argv: list[str], cfg: dict[str, Any]) -> int:
             "wrapper": wrapper,
             "exit_code": proc.returncode,
             "duration_ms": duration_ms,
-            "bytes_out": len(proc.stdout),
+            "bytes_out": out_total,
             "truncated": truncated,
+            **({"kept": "tail" if tail_first else "head"} if truncated else {}),
         }
     )
 
@@ -234,7 +285,8 @@ def run_argv(argv: list[str], cfg: dict[str, Any]) -> int:
     # left the machine. Anyone with this key — including someone bypassing our client
     # entirely — would otherwise get `docker inspect` output with Config.Env intact,
     # which is precisely where a container's .env ends up.
-    text_out = out.decode("utf-8", errors="replace")
+    text_out = _seam(out.decode("utf-8", errors="replace"), out_total > max_bytes, tail_first)
+    text_err = _seam(err.decode("utf-8", errors="replace"), err_total > max_bytes, tail_first)
     if _is_env_bearing(argv):
         text_out = redact_docker_inspect(text_out, cfg.get("env_allowlist") or [])
     # Structural scrubs, driven by the output's shape rather than by keywords: the
@@ -251,13 +303,54 @@ def run_argv(argv: list[str], cfg: dict[str, Any]) -> int:
     text_out = redact_text(text_out, cfg.get("redact_patterns") or [])
 
     sys.stdout.buffer.write(text_out.encode("utf-8"))
-    sys.stderr.buffer.write(redact_text(err.decode("utf-8", errors="replace")).encode("utf-8"))
+    sys.stderr.buffer.write(redact_text(text_err).encode("utf-8"))
     if truncated:
-        print(
-            f"\n[safereach-shim] output truncated at {max_bytes} bytes",
-            file=sys.stderr,
-        )
+        omitted = max(0, out_total - len(out)) + max(0, err_total - len(err))
+        tag = {"omitted_bytes": omitted, "kept": "tail" if tail_first else "head"}
+        # Last line, machine-readable: the client strips it and sets `truncated`.
+        print(f"\n{TRUNCATION_TAG} {json.dumps(tag)}", file=sys.stderr)
     return proc.returncode
+
+
+def _drain(pipe: Any, limit: int, keep_tail: bool, sink: dict[str, Any]) -> None:
+    """Read ``pipe`` to EOF, keeping at most ``limit`` bytes from its start or its end.
+
+    The pipe is always read to the end even once the head is full: a writer blocked on a
+    full pipe never exits, and the command would then die on the timeout instead.
+    """
+    total = 0
+    buf = bytearray()
+    read = getattr(pipe, "read1", pipe.read)
+    while True:
+        chunk = read(65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if keep_tail:
+            buf += chunk
+            if len(buf) > 2 * limit:
+                del buf[:-limit]
+        elif len(buf) < limit:
+            buf += chunk[: limit - len(buf)]
+    if len(buf) > limit:
+        del buf[:-limit]
+    sink["data"] = bytes(buf)
+    sink["total"] = total
+
+
+def _seam(text: str, was_cut: bool, keep_tail: bool) -> str:
+    """Drop the partial line a byte cut leaves at the seam.
+
+    Half a line of a stack trace reads as a different error, and a cut through a
+    multi-byte character decodes to a replacement glyph; both live on that one line.
+    """
+    if not was_cut:
+        return text
+    if keep_tail:
+        nl = text.find("\n")
+        return text[nl + 1 :] if 0 <= nl < len(text) - 1 else text
+    nl = text.rfind("\n")
+    return text[: nl + 1] if nl > 0 else text
 
 
 def handle_elevated(name: str, cfg: dict[str, Any]) -> int:
@@ -408,7 +501,7 @@ EXEC_INNER_SPEC = {
         },
         "positionals": {
             "max": 3,
-            "specs": [{"pattern": r"[^`$\\]{1,200}"}],
+            "specs": [{"pattern": r".{1,200}"}],
             "rest": {
                 "pattern": r"/[A-Za-z0-9._/\-]{1,200}",
                 "path_prefixes_from": "exec_path_prefixes",

@@ -41,7 +41,7 @@ from .console import console, status_mark, status_table
 from .discovery import scp_command, ssh_command
 from .install import adapters as ad
 from .ssh import SHELL_ANSWERED, SSHError, SSHPool, unrestricted_key_message
-from .validator import BUILTIN_DENY_PATHS, Rejected, render, validate
+from .validator import BUILTIN_DENY_PATHS, Rejected, check_log_dir, render, validate
 from .versioning import fingerprint
 
 OK = "ok"
@@ -308,6 +308,7 @@ DEFAULT_ALLOW = [
     "tail",
     "head",
     "grep",
+    "zgrep",
     "stat",
     "ls",
     "docker",
@@ -709,12 +710,43 @@ def _upload(
     return None
 
 
+def _existing_log_paths(settings: Settings | None, alias: str) -> list[str]:
+    """Log directories hosts.yaml already records for ``alias``, so re-enrolling keeps them.
+
+    Matched by key or by ``ssh_config_host``: a host enrolled as `web-1` and then renamed
+    `app` is still the same machine when `enroll web-1` runs again.
+    """
+    if settings is None:
+        return []
+    for key, host in settings.hosts.items():
+        if alias in (key, host.ssh_config_host):
+            return list(host.log_paths)
+    return []
+
+
+def _enroll_log_paths(
+    aliases: list[str], settings: Settings | None, requested: list[str]
+) -> dict[str, list[str]]:
+    """Per-host log directories: what hosts.yaml has, plus every `--log-path` given.
+
+    Each one is checked here, before any host is touched, so a typo like `/opt/` fails
+    the command instead of half-enrolling a fleet. The host re-checks on its side.
+    """
+    extra = [check_log_dir(p) for p in requested]
+    out: dict[str, list[str]] = {}
+    for alias in aliases:
+        paths = _existing_log_paths(settings, alias)
+        out[alias] = paths + [p for p in extra if p not in paths]
+    return out
+
+
 def _enroll_one(
     alias: str,
     shim: Path,
     expected: str,
     settings: Settings | None,
     elevated: list[str] | None = None,
+    log_paths: list[str] | None = None,
 ) -> dict | None:
     """Install the shim and a restricted key on one host, over existing SSH access."""
     elevated = elevated or []
@@ -755,6 +787,8 @@ def _enroll_one(
         "docker_host": host_cfg.docker_host if host_cfg else None,
         "command_timeout": 30,
         "max_output_bytes": 65536,
+        "max_log_output_bytes": 131072,
+        "log_path_prefixes": list(log_paths or []),
         "elevated": {name: ELEVATED_RECIPES[name] for name in elevated},
     }
 
@@ -909,6 +943,7 @@ def _enroll_hardened(
     allow_exec: bool = False,
     exec_containers: list[str] | None = None,
     exec_paths: list[str] | None = None,
+    log_paths: list[str] | None = None,
 ) -> dict | None:
     """Create a dedicated unprivileged account and enrol against that, not your own.
 
@@ -994,6 +1029,8 @@ def _enroll_hardened(
         "env_allowlist": sorted(host_cfg.env_allowlist) if host_cfg else [],
         "command_timeout": 30,
         "max_output_bytes": 65536,
+        "max_log_output_bytes": 131072,
+        "log_path_prefixes": list(log_paths or []),
         "elevated": {name: ELEVATED_RECIPES[name] for name in elevated},
     }
 
@@ -1175,6 +1212,14 @@ def cmd_enroll(args: argparse.Namespace) -> int:
             say(f"{BAD} --allow-exec needs at least one absolute --exec-path PREFIX")
             return 2
 
+    try:
+        log_paths = _enroll_log_paths(aliases, settings, args.log_path)
+    except Rejected as rej:
+        say(f"{BAD} --log-path: {rej.reason}")
+        if rej.suggestion:
+            say(f"   {rej.suggestion}")
+        return 2
+
     chosen_names = _resolve_enroll_names(aliases, args)
 
     if args.hardened:
@@ -1210,6 +1255,7 @@ def cmd_enroll(args: argparse.Namespace) -> int:
                     args.allow_exec,
                     args.exec_container,
                     args.exec_path,
+                    log_paths[alias],
                 )
             )
         ]
@@ -1217,7 +1263,7 @@ def cmd_enroll(args: argparse.Namespace) -> int:
         enrolled = [
             r
             for alias in aliases
-            if (r := _enroll_one(alias, shim, expected, settings, args.elevated))
+            if (r := _enroll_one(alias, shim, expected, settings, args.elevated, log_paths[alias]))
         ]
     if not enrolled:
         say(f"\n{BAD} nothing was enrolled")
@@ -1278,6 +1324,7 @@ def cmd_enroll(args: argparse.Namespace) -> int:
             f"    allow: [{', '.join(default_allow)}]",
             "    curl_targets: [localhost, 127.0.0.1]",
             *([f"    elevated: [{', '.join(args.elevated)}]"] if args.elevated else []),
+            *([f"    log_paths: [{', '.join(log_paths[alias])}]"] if log_paths.get(alias) else []),
             "",
         ]
 
@@ -1451,6 +1498,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         host = settings.host(args.host)
         allow = host.allow or None
         ctx["curl_targets"] = list(host.curl_targets)
+        ctx["log_path_prefixes"] = list(host.log_paths)
 
     try:
         result = validate(args.command, spec, allow=allow, ctx=ctx)
@@ -2149,6 +2197,8 @@ def _shim_config(host: HostConfig, settings: Settings) -> dict[str, Any]:
         "docker_host": host.docker_host,
         "command_timeout": host.timeout(settings.defaults),
         "max_output_bytes": host.max_bytes(settings.defaults),
+        "max_log_output_bytes": host.max_log_bytes(settings.defaults),
+        "log_path_prefixes": list(host.log_paths),
         "elevated": {
             name: ELEVATED_RECIPES[name] for name in host.elevated if name in ELEVATED_RECIPES
         },
@@ -2558,6 +2608,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PREFIX",
         help="directory prefix cat/tail/head/grep may read inside a container, e.g. "
         "/app/storage/logs/ (repeatable; required with --allow-exec)",
+    )
+    p.add_argument(
+        "--log-path",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="an application log directory on the host that tail/head/grep/zgrep may read "
+        "in addition to /var/log, e.g. /opt/app/logs/ (repeatable; kept on re-enrolment)",
     )
     p.set_defaults(func=cmd_enroll)
 

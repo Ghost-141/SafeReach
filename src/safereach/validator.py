@@ -25,6 +25,7 @@ Design invariants, in order of importance:
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -36,7 +37,10 @@ __all__ = [
     "MUTATING_VERBS",
     "RESOURCE_ALIASES",
     "Rejected",
+    "check_log_dir",
     "docker_host_deny_targets",
+    "keeps_tail",
+    "trim_output",
     "ValidationResult",
     "validate",
     "validate_argv",
@@ -56,16 +60,21 @@ MAX_TOKEN_LEN = 512
 #: way past a naive single-line check, so this runs on the raw string.
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 
-#: Tokens that look like shell operators. ``shlex`` does not split on these — it glues
-#: them onto adjacent tokens — so this is a belt-and-braces check that produces a much
-#: better error message than "unknown flag '-h;'".
+#: Characters that are shell operators when they appear OUTSIDE quotes. ``shlex`` does
+#: not split on these — it glues them onto adjacent tokens — so this is a belt-and-braces
+#: check that produces a much better error message than "unknown flag '-h;'".
 #:
 #: Note that ``{`` and ``}`` are deliberately absent: ``docker inspect --format
 #: '{{.State.Status}}'`` and ``curl -w '%{http_code}'`` both need them, and brace
 #: expansion is inert once the token is re-quoted. Security here comes from the
-#: re-quoting in :func:`render`, not from this pattern — this exists to turn a confusing
+#: re-quoting in :func:`render`, not from this set — this exists to turn a confusing
 #: "unknown flag '-h;'" into a message that explains the actual problem.
-_SHELL_META_RE = re.compile(r"[;&|<>`$()]|\\\n")
+#:
+#: Inside quotes the same characters are just text. ``grep -E "timeout|ECONNRESET"`` is a
+#: search pattern, not a pipe: the token is re-quoted before it leaves this machine and
+#: executed with no shell on the host, so refusing it bought nothing and cost the agent
+#: alternation, anchors and grouping in every log search.
+_SHELL_META_CHARS = frozenset(";&|<>`$()")
 
 _NUMERIC_RE = re.compile(r"^-?\d+$")
 
@@ -226,6 +235,45 @@ BUILTIN_DENY_PATHS: tuple[str, ...] = (
     "/etc/safereach/*",
     "/usr/local/bin/safereach-shim",
 )
+
+#: Directories a host's log-path policy may never name, whatever the operator types.
+#: A log directory is a leaf — `/opt/app/logs/` — and these are the roots that would
+#: quietly turn "read the app's logs" into "read the app": its config, its uploads,
+#: every other user's home. Matched exactly; a directory *below* one of them is fine.
+BROAD_LOG_ROOTS: frozenset[str] = frozenset(
+    {
+        "/",
+        "/app/",
+        "/data/",
+        "/home/",
+        "/mnt/",
+        "/opt/",
+        "/root/",
+        "/run/",
+        "/srv/",
+        "/tmp/",
+        "/usr/",
+        "/usr/local/",
+        "/var/",
+        "/var/lib/",
+        "/var/www/",
+    }
+)
+
+#: Trees a log path may not sit under at all. Container storage is the whole filesystem
+#: of every container, `.env` files included; the rest hold no logs worth the exposure.
+_FORBIDDEN_LOG_TREES: tuple[str, ...] = (
+    "/boot/",
+    "/dev/",
+    "/etc/",
+    "/proc/",
+    "/sys/",
+    "/var/lib/containerd/",
+    "/var/lib/docker/",
+    "/var/lib/kubelet/",
+)
+
+_LOG_DIR_RE = re.compile(r"/[A-Za-z0-9._/\-]{1,200}")
 
 #: kubectl resource abbreviations, expanded before a positional deny is checked.
 #: `kubectl get sa` and `kubectl get serviceaccounts` are the same request; denying one
@@ -415,6 +463,49 @@ def _denied_path(token: str, patterns: list[str]) -> str | None:
     return None
 
 
+def check_log_dir(path: str, deny_paths: list[str] | tuple[str, ...] = BUILTIN_DENY_PATHS) -> str:
+    """Normalise one host log directory, or raise :class:`Rejected` saying why it is unsafe.
+
+    The single gate for every log directory, wherever it was typed: `enroll --log-path`,
+    `hosts.yaml`, and — because the host trusts nothing it did not check itself — the
+    shim reading its own policy file. Returns the path with exactly one trailing slash,
+    which is what makes the prefix test a directory test: `/opt/app/logs/` does not
+    admit `/opt/app/logs-evil/`.
+    """
+    if not isinstance(path, str) or not _LOG_DIR_RE.fullmatch(path):
+        raise Rejected(
+            f"log path {path!r} must be absolute and use only letters, digits, '.', '_', '-' "
+            "and '/'"
+        )
+    parts = path.split("/")
+    if ".." in parts or "." in parts or "//" in path:
+        raise Rejected(f"log path {path!r} must not contain '.', '..' or '//' segments")
+    norm = path.rstrip("/") + "/"
+    if norm in BROAD_LOG_ROOTS or (norm.startswith("/home/") and norm.count("/") <= 3):
+        raise Rejected(
+            f"log path {norm!r} is too broad — it would expose far more than logs",
+            "name the directory the application writes its logs into, e.g. /opt/app/logs/",
+        )
+    for tree in _FORBIDDEN_LOG_TREES:
+        if norm.startswith(tree):
+            raise Rejected(f"log path {norm!r} is under {tree}, which never holds readable logs")
+    denied = _denied_path(norm, list(deny_paths)) or _denied_path(
+        norm.rstrip("/"), list(deny_paths)
+    )
+    if denied:
+        raise Rejected(f"log path {norm!r} is on the protected-path list ({denied})")
+    return norm
+
+
+def _within(value: str, prefixes: list[str]) -> bool:
+    """Directory-prefix test that also accepts the directory itself without its slash.
+
+    `ls /var/log` names the same directory as `ls /var/log/`; refusing the first form was
+    a papercut with no security content, since the prefix is the directory either way.
+    """
+    return any(value.startswith(p) or value + "/" == p for p in prefixes)
+
+
 def _denied_positional(value: str, deny: dict[str, Any]) -> str | None:
     """Match a denied positional, tolerating the forms a resource name can take.
 
@@ -458,7 +549,7 @@ def _check_positional(value: str, pspec: dict[str, Any], ctx: dict[str, Any]) ->
     if pattern and not re.fullmatch(pattern, value):
         raise Rejected(f"argument {value!r} is not permitted here")
 
-    prefixes = pspec.get("path_prefixes")
+    prefixes = list(pspec.get("path_prefixes") or [])
     prefixes_key = pspec.get("path_prefixes_from")
     if prefixes_key:
         # Prefixes supplied by the host's own policy rather than by the spec — the
@@ -470,6 +561,13 @@ def _check_positional(value: str, pspec: dict[str, Any], ctx: dict[str, Any]) ->
                 "this host has no permitted paths configured for this command",
                 f"the operator sets '{prefixes_key}' in the host policy (enroll --exec-path)",
             )
+    extra_key = pspec.get("extra_path_prefixes_from")
+    if extra_key:
+        # Added to the spec's own prefixes, never replacing them: /var/log stays readable
+        # everywhere, and a host that runs a PM2 or Node app writing to
+        # /opt/app/logs/ says so in its policy (enroll --log-path) instead of the agent
+        # finding the files with `ls` and then being refused at `tail`.
+        prefixes += list(ctx.get(extra_key) or [])
     if prefixes:
         # Reject traversal before the prefix check, so ``/var/log/../../etc/shadow``
         # cannot satisfy the prefix and then climb out of it.
@@ -478,15 +576,48 @@ def _check_positional(value: str, pspec: dict[str, Any], ctx: dict[str, Any]) ->
                 f"path {value!r} contains '..'",
                 "use an absolute path with no parent-directory segments",
             )
-        if not any(value.startswith(p) for p in prefixes):
+        if not _within(value, prefixes):
             raise Rejected(
                 f"path {value!r} is outside the permitted locations",
-                f"permitted prefixes: {', '.join(prefixes)}",
+                f"permitted prefixes: {', '.join(prefixes)}"
+                + (
+                    " — application log directories are added per host with "
+                    "`safereach enroll <host> --log-path DIR`"
+                    if extra_key
+                    else ""
+                ),
             )
+        if ctx.get("resolve_symlinks"):
+            _check_resolved(value, prefixes, ctx)
 
     allow_key = pspec.get("host_allowlist_from")
     if allow_key:
         _check_url_host(value, ctx.get(allow_key) or [], ctx.get("curl_deny_targets") or [])
+
+
+def _check_resolved(value: str, prefixes: list[str], ctx: dict[str, Any]) -> None:
+    """Re-test a path after resolving symlinks. Only the shim sets ``resolve_symlinks``.
+
+    The string checks above are all the client can do — the path does not exist on this
+    machine. On the host it does, and an application's own log directory is writable by
+    the application, so `/opt/app/logs/x.log -> /opt/app/.env` is one careless deploy
+    script away. /var/log is root's; an app log directory is not.
+    """
+    real = os.path.realpath(value)
+    if real == value.rstrip("/") or real + "/" == value:
+        return
+    real_prefixes = [os.path.realpath(p).rstrip("/") + "/" for p in prefixes]
+    if not _within(real, real_prefixes):
+        raise Rejected(
+            f"path {value!r} resolves outside the permitted locations",
+            "symlinks may not lead out of a permitted directory",
+        )
+    denied = _denied_path(real, ctx.get("deny_paths") or [])
+    if denied:
+        raise Rejected(
+            f"path {value!r} resolves to a protected path ({denied})",
+            "secrets are deliberately unreadable; ask the operator for the value",
+        )
 
 
 #: Ports a bare hostname entry in ``curl_targets`` covers. ``localhost`` used to mean
@@ -707,16 +838,17 @@ def validate(
             "send a single-line command with no embedded newlines",
         )
 
-    # 3. Shell operators. shlex would silently glue these onto a neighbouring token, so
-    #    catching them here is purely for the error message — step 8 makes them inert
-    #    regardless.
-    meta = _SHELL_META_RE.search(command)
+    # 3. Shell operators outside quotes. shlex would silently glue these onto a
+    #    neighbouring token, so catching them here is purely for the error message —
+    #    step 8 makes them inert regardless.
+    meta = _unquoted_meta(command)
     if meta:
         raise Rejected(
-            f"shell metacharacter {meta.group()!r} is not permitted "
+            f"shell metacharacter {meta!r} is not permitted "
             "(no pipes, redirects, subshells or command chaining)",
             "run one command at a time and use the tool's own filtering flags, "
-            "e.g. `journalctl -u nginx -n 200 --grep error`",
+            'e.g. `journalctl -u nginx -n 200 --grep "timeout|refused"` — '
+            "inside quotes, | ( ) $ are ordinary regex characters",
         )
 
     # 4. Tokenise, then hand the token list to the real validator.
@@ -726,6 +858,36 @@ def validate(
         raise Rejected(f"could not parse command: {exc}", "check for unbalanced quotes") from exc
 
     return validate_argv(argv, spec, allow=allow, ctx=ctx)
+
+
+def _unquoted_meta(command: str) -> str | None:
+    """The first shell operator character that sits outside any quotes, if one does.
+
+    Follows POSIX quoting as ``shlex.split`` does: single quotes are literal to the next
+    single quote, double quotes honour backslash escapes, and an unquoted backslash
+    makes the next character literal. An unbalanced quote returns None here and is
+    refused by the tokeniser in the next step with its own message.
+    """
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+        elif quote == '"':
+            if ch == "\\":
+                i += 1
+            elif ch == '"':
+                quote = None
+        elif ch == "\\":
+            i += 1
+        elif ch in "'\"":
+            quote = ch
+        elif ch in _SHELL_META_CHARS:
+            return ch
+        i += 1
+    return None
 
 
 def validate_argv(
@@ -981,7 +1143,13 @@ def _parse_args(
             raise Rejected(f"{name} expects a value but none was given")
 
         _check_value(vspec, value, name, ctx)
-        out.extend([name, value])
+        if inline is not None and value.startswith("-"):
+            # Keep a dash-led value attached. Split into two tokens, `--sort=-rss` comes
+            # back as `--sort -rss`, which the check above then reads as a dropped value
+            # — so the shim refused what this side accepted, breaking idempotency.
+            out.append(f"{name}={value}" if name.startswith("--") else f"{name}{value}")
+        else:
+            out.extend([name, value])
         i += consumed
 
     _check_positionals(positionals, pspec, binary, ctx)
@@ -1038,8 +1206,18 @@ def _expand_cluster(token: str, flags: dict[str, dict[str, Any]], binary: str) -
 # --------------------------------------------------------------------------------------
 
 
-def spec_summary(spec: dict[str, Any], allow: list[str] | None = None) -> dict[str, Any]:
-    """Render the allowlist in a form an agent can read and act on."""
+def spec_summary(
+    spec: dict[str, Any],
+    allow: list[str] | None = None,
+    ctx: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Render the allowlist in a form an agent can read and act on.
+
+    ``ctx`` is the host context; when given, host-supplied path prefixes (a host's log
+    directories) are listed alongside the spec's own, so the agent reads the real
+    locations instead of discovering them one refusal at a time.
+    """
+    ctx = ctx or {}
     out: dict[str, Any] = {}
     for binary, bspec in sorted(spec.items()):
         if allow is not None and binary not in allow:
@@ -1062,8 +1240,16 @@ def spec_summary(spec: dict[str, Any], allow: list[str] | None = None) -> dict[s
             entry["note"] = "long flags only (e.g. --follow, not -f)"
 
         pspec = bspec.get("positionals") or {}
-        if pspec.get("path_prefixes"):
-            entry["paths_limited_to"] = pspec["path_prefixes"]
+        paths: list[str] = []
+        for rule in (pspec, pspec.get("rest") or {}):
+            for prefix in [
+                *(rule.get("path_prefixes") or []),
+                *(ctx.get(rule.get("extra_path_prefixes_from") or "") or []),
+            ]:
+                if prefix not in paths:
+                    paths.append(prefix)
+        if paths:
+            entry["paths_limited_to"] = paths
         if bspec.get("deny_subcommands"):
             entry["never_permitted"] = sorted(bspec["deny_subcommands"])
         denied_resources = (bspec.get("positionals") or {}).get("deny")
@@ -1081,3 +1267,56 @@ def spec_summary(spec: dict[str, Any], allow: list[str] | None = None) -> dict[s
 
         out[binary] = entry
     return out
+
+
+# --------------------------------------------------------------------------------------
+# Output shaping — here because this module is inlined into the shim, and both sides
+# must cut output the same way
+# --------------------------------------------------------------------------------------
+
+#: The last stderr line the shim writes when it cut a stream, followed by a JSON object
+#: (``omitted_bytes``, ``kept``). The client strips it and sets ``truncated``; before
+#: this, a host-side cut arrived just under the client's own limit and was reported as
+#: not truncated at all.
+TRUNCATION_TAG = "@safereach-truncated"
+
+#: Binaries whose output is chronological, oldest first. When one of these overflows
+#: the byte budget, the lines worth keeping are the LAST ones — the error the agent was
+#: sent to find happened a minute ago, not at the start of the window it asked for.
+_TAIL_FIRST_BINARIES = frozenset({"journalctl", "dmesg", "tail", "grep", "zgrep"})
+
+
+def keeps_tail(argv: list[str]) -> bool:
+    """Whether overflowing output from ``argv`` should keep its end rather than its start."""
+    if not argv:
+        return False
+    binary = argv[0]
+    if binary == "journalctl":
+        return not any(t in ("-r", "--reverse") for t in argv[1:])
+    if binary in _TAIL_FIRST_BINARIES:
+        return True
+    if binary in ("docker", "kubectl"):
+        return "logs" in argv[1:4]
+    return False
+
+
+def trim_output(text: str, limit: int, keep_tail: bool) -> tuple[str, int]:
+    """Cut ``text`` to at most ``limit`` characters on a line boundary.
+
+    Returns ``(kept, omitted)``. A cut never leaves half a line at the seam: a partial
+    first line (tail) or last line (head) is dropped, because a half-line of a stack
+    trace reads as a different error.
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text, 0
+    if keep_tail:
+        kept = text[-limit:]
+        nl = kept.find("\n")
+        if 0 <= nl < len(kept) - 1:
+            kept = kept[nl + 1 :]
+    else:
+        kept = text[:limit]
+        nl = kept.rfind("\n")
+        if nl > 0:
+            kept = kept[: nl + 1]
+    return kept, len(text) - len(kept)

@@ -4,6 +4,34 @@ All notable changes, newest first. Versions are PyPI releases; each is tagged `v
 Every entry says what a user has to do on upgrade, because a shim fingerprint change
 refuses every host until `safereach shim-update --all` runs.
 
+## Unreleased — reading the logs that matter
+
+The shim fingerprint **changes** (validator, spec and shim all changed), so run
+`safereach shim-update --all` after upgrading; hosts are refused until it runs. To add
+`zgrep` to a host enrolled earlier, add it to that host's `allow` list in `hosts.yaml`
+and re-enrol it.
+
+- **Application log directories.** `safereach enroll <host> --log-path DIR` (repeatable)
+  lets `tail`, `head`, `grep`, `zgrep`, `ls` and `stat` read an app's own log directory
+  as well as `/var/log`. The directory is checked on both sides (no broad roots, nothing
+  under `/etc`, `/proc`, `/sys` or container storage, nothing on the protected-path list),
+  and the shim re-checks every path after resolving symlinks. Kept on re-enrolment;
+  listed to the agent by `describe_commands`.
+- **Long log output keeps the newest lines.** `journalctl`, `docker logs`, `kubectl logs`,
+  `tail`, `grep`, `zgrep` and `dmesg` overflow from the end, not the start, cut on a line
+  boundary, with a separate budget (`max_log_output_bytes`, default 128 KB). The shim
+  streams into bounded buffers instead of collecting everything, and tells the client
+  when it cut, so `truncated` is now true whenever anything was dropped.
+- **Regex in search patterns.** `| ( ) $ \` inside quotes are ordinary characters:
+  `grep -E "timeout|ECONNRESET"`, `journalctl --grep "^Error.*$"`. Unquoted, they are
+  refused exactly as before.
+- **New `zgrep`** for rotated `.gz` logs, in the same locations as `grep`.
+- **Fixes.** `ls /var/log` (no trailing slash) is accepted. `ps --sort=-rss` is no longer
+  accepted by the client and then refused by the shim.
+- **Hints.** A unit with an empty journal, a restricted `dmesg`, and an unreadable file
+  now come back with a `hint` naming the next step. A command killed by a signal says
+  which one.
+
 ## 0.4.0 — operating a fleet: list hosts, unenrol hosts
 
 Upgrade with `uvx safereach@0.4.0 install`. The shim fingerprint is **unchanged**, so no

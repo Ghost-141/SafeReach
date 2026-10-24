@@ -124,6 +124,32 @@ Reaching the host uses your own access, never the enrolled key — the enrolled 
 only invoke the shim. `--via <ssh alias>` names the route explicitly; without it the
 command tries the host's own alias in `~/.ssh/config`, then `--admin-user@hostname`.
 
+## Application log directories
+
+`tail`, `head`, `grep`, `zgrep`, `ls` and `stat` read under `/var/log/` everywhere. An
+app run by PM2, supervisor or a plain `node app.js >> logs/app.log` writes somewhere
+else, and its systemd unit's journal is empty (`-- No entries --`). Name the directory at
+enrolment and the agent can read it too:
+
+```bash
+safereach enroll myserver --log-path /opt/app/logs/ --log-path /home/app/.pm2/logs/
+```
+
+The directories go into the host's own policy and into `hosts.yaml` as `log_paths`;
+re-enrolling keeps them, so `--log-path` only ever adds. The agent sees them in
+`describe_commands` as `application_log_paths`.
+
+Each directory must be a leaf where logs live. Broad roots (`/`, `/opt/`, `/srv/`,
+`/home/<user>/`, `/var/lib/`), anything under `/etc`, `/proc`, `/sys` or container storage,
+and anything on the protected-path list are refused, by the CLI and again by the shim
+reading its own policy. The protected-path list still applies inside the directory, so a
+`.env` that sits next to the logs stays unreadable. On the host every path is also
+checked after resolving symlinks: `logs/x.log -> ../.env` is refused.
+
+The account still needs read permission on the files. In plain mode it is your own
+account, which usually owns the app's logs already; in hardened mode grant the diag
+group read access to the directory.
+
 ## Container inspection
 
 `docker logs` covers apps logging to stdout. When a framework writes to a file instead

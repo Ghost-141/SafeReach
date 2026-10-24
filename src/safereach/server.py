@@ -42,6 +42,7 @@ from .validator import (
     BUILTIN_DENY_PATHS,
     Rejected,
     docker_host_deny_targets,
+    keeps_tail,
     render,
     spec_summary,
     validate,
@@ -73,6 +74,11 @@ class CommandResult(BaseModel):
     stderr: str
     truncated: bool
     duration_ms: int
+    hint: str | None = Field(
+        default=None,
+        description="What to try next, when the output is a known dead end "
+        "(an empty journal, a restricted kernel log, an unreadable file)",
+    )
 
 
 class HostResult(BaseModel):
@@ -177,6 +183,7 @@ def _host_ctx(host: HostConfig) -> dict[str, Any]:
         "curl_targets": list(host.curl_targets),
         "curl_deny_targets": docker_host_deny_targets(host.docker_host),
         "deny_paths": list(BUILTIN_DENY_PATHS),
+        "log_path_prefixes": list(host.log_paths),
     }
 
 
@@ -341,7 +348,7 @@ async def _execute(app: AppContext, host: HostConfig, command: str) -> CommandRe
         payload = wire
 
     try:
-        raw = await app.pool.run(host, payload)
+        raw = await app.pool.run(host, payload, log_output=keeps_tail(argv))
     except SSHError as exc:
         app.audit.error(host=host.alias, host_id=host.id, requested=command, error=str(exc))
         raise ToolError(str(exc)) from exc
@@ -365,7 +372,41 @@ async def _execute(app: AppContext, host: HostConfig, command: str) -> CommandRe
         stderr=result.stderr,
         truncated=result.truncated,
         duration_ms=result.duration_ms,
+        hint=_hint(host, argv, result),
     )
+
+
+def _hint(host: HostConfig, argv: list[str], result: ExecResult) -> str | None:
+    """Name the next step when a command ran fine but told the agent nothing.
+
+    Each case is one the audit log showed an agent looping on: re-querying an empty
+    journal with different filters, or retrying `dmesg` with other levels, when the
+    answer was "this source is the wrong one".
+    """
+    binary = argv[0]
+    out, err = result.stdout.strip(), result.stderr
+    if binary == "journalctl" and "-u" in argv and out == "-- No entries --":
+        where = (
+            f"this host's application log directories: {', '.join(host.log_paths)}"
+            if host.log_paths
+            else "`docker logs <container>`, or ask the operator to register the app's "
+            "log directory with `safereach enroll <host> --log-path DIR`"
+        )
+        return (
+            "This unit wrote nothing to the journal in that window. Services run under "
+            "PM2, supervisor or a container usually log to files instead — try " + where
+        )
+    if binary == "dmesg" and result.exit_code != 0 and "not permitted" in err:
+        return (
+            "The kernel log is restricted for this account (kernel.dmesg_restrict). "
+            "The same messages are readable as `journalctl -k -p err -n 200`."
+        )
+    if binary in ("tail", "head", "grep", "zgrep", "ls", "stat") and "Permission denied" in err:
+        return (
+            "The path is permitted but this account cannot read it. The operator grants "
+            "read access on the host (group membership or an ACL); retrying will not help."
+        )
+    return None
 
 
 # --------------------------------------------------------------------------------------
@@ -431,6 +472,8 @@ def describe_commands(ctx: Context[AppContext], host: str | None = None) -> dict
     app = ctx.request_context.lifespan_context
     allow: list[str] | None = None
     elevated: list[str] = []
+    host_ctx: dict[str, Any] = {}
+    log_paths: list[str] = []
     target = (
         host
         or app.selected_host
@@ -440,17 +483,30 @@ def describe_commands(ctx: Context[AppContext], host: str | None = None) -> dict
         cfg = _host(app, target)
         allow = cfg.allow or None
         elevated = sorted(cfg.elevated)
+        host_ctx = _host_ctx(cfg)
+        log_paths = list(cfg.log_paths)
 
     return {
-        "commands": spec_summary(app.spec, allow),
+        "commands": spec_summary(app.spec, allow, host_ctx),
         "elevated_recipes": elevated,
+        "application_log_paths": log_paths,
         "rules": [
             "One command per call. No pipes, redirects, subshells or ';' chaining.",
             "Only allowlisted binaries, and only their listed flags.",
             "File paths are restricted to the locations shown per command.",
             "Everything is read-only; nothing here can change state.",
             "Use a command's own filtering flags instead of piping to grep, "
-            "e.g. `journalctl -u nginx -n 200 --grep error`.",
+            'e.g. `journalctl -u nginx -n 200 --grep "timeout|refused"`.',
+            "Inside quotes, | ( ) $ and \\ are ordinary regex characters in search patterns.",
+            "Application logs that are not in journald live in `application_log_paths` "
+            "(read them with tail/grep)"
+            + (
+                " or behind `docker logs <container>`."
+                if allow is None or "docker" in allow
+                else "."
+            ),
+            "Long log output keeps the NEWEST lines; when `truncated` is true, narrow the "
+            "window with --since/--until, -n, or --grep.",
         ],
     }
 
