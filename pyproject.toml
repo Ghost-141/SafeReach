@@ -1,6 +1,6 @@
 [project]
 name = "safereach"
-version = "0.5.0"
+version = "0.5.1"
 description = "Read-only remote diagnostics over SSH, exposed as an MCP server"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -71,6 +71,9 @@ packages = ["src/safereach"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Explicit, because pytest-asyncio >= 1.4 warns when it is unset — and with
+# filterwarnings = error below, that warning aborts the run before any test is collected.
+asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["error"]
 
 [tool.ruff]

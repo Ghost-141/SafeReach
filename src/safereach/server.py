@@ -302,11 +302,16 @@ async def _ensure_shim(app: AppContext, host: HostConfig) -> None:
         return
 
     if version != app.expected_fingerprint:
+        # Forget the stale answer. Cached, it outlived the fix: the operator updated the
+        # shim and the agent kept being refused until the MCP server was restarted.
+        app.shim_versions.pop(host.alias, None)
         raise ToolError(
             f"Host {host.alias!r} is running safereach-shim {version}, but this server "
             f"expects {app.expected_fingerprint}. The host's allowlist and this "
             "server's no longer agree, so commands are refused.\n"
-            f"Redeploy with: safereach shim-update {host.alias}"
+            f"The operator updates it with: safereach shim-update {host.alias} "
+            "(or `safereach doctor --fix` for every host). Retry once that has run; "
+            "no restart is needed."
         )
 
 

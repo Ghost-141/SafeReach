@@ -18,6 +18,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import stat
 import subprocess
@@ -1665,9 +1666,32 @@ def cmd_validate(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------------------
 
 
-async def _probe_hosts(
-    settings: Settings, expected: str, fix: bool = False
+def _fix_stale(
+    rows: list[tuple[str, str, str]],
+    settings: Settings,
+    args: argparse.Namespace,
+    expected: str,
 ) -> list[tuple[str, str, str]]:
+    """`doctor --fix`: re-push the shim to every host whose shim is stale.
+
+    Runs after the probe rather than inside it, because the update verifies itself with
+    a fresh probe of its own.
+    """
+    stale = [alias for marker, alias, detail in rows if marker == BAD and " != expected " in detail]
+    if not stale:
+        return rows
+    try:
+        shim_path, built = _build_shim()
+    except RuntimeError as exc:
+        return [(m, a, f"{d} (could not build the shim: {exc})") for m, a, d in rows]
+    fixed: dict[str, tuple[str, str, str]] = {}
+    for alias in stale:
+        ok, detail = _update_shim(settings.hosts[alias], settings, args, shim_path, built)
+        fixed[alias] = (OK if ok else BAD, alias, f"shim was stale; {detail}")
+    return [fixed.get(alias, (m, alias, d)) for m, alias, d in rows]
+
+
+async def _probe_hosts(settings: Settings, expected: str) -> list[tuple[str, str, str]]:
     pool = SSHPool(settings.defaults)
     rows: list[tuple[str, str, str]] = []
     try:
@@ -1684,17 +1708,14 @@ async def _probe_hosts(
                     return (WARN, host.alias, "client-only: no shim, this key has a shell")
                 return (WARN, host.alias, f"reachable, no shim — run `enroll {host.alias}`")
             if version != expected:
-                # Drift is the realistic failure mode, and since enrolment needs no root
-                # the fix costs nothing. `doctor --fix` re-pushes rather than telling you
-                # to run yet another command.
-                if fix:
-                    if _push_shim(host.alias):
-                        return (OK, host.alias, f"shim was stale; re-pushed {expected}")
-                    return (BAD, host.alias, f"shim {version} is stale and re-push failed")
+                # Drift is the realistic failure mode — every release that changes the
+                # spec causes it. `doctor --fix` re-pushes (see cmd_doctor) rather than
+                # telling you to run yet another command.
                 return (
                     BAD,
                     host.alias,
-                    f"shim {version} != expected {expected} — run `doctor --fix`",
+                    f"shim {version} != expected {expected} — run `doctor --fix` "
+                    f"or `shim-update {host.alias}`",
                 )
             return (OK, host.alias, f"reachable, shim {version}")
 
@@ -1702,47 +1723,6 @@ async def _probe_hosts(
     finally:
         await pool.close()
     return rows
-
-
-def _push_shim(alias: str) -> bool:
-    """Re-install the shim on one enrolled host. No root needed, so this is safe to
-    do automatically as part of `doctor --fix`."""
-    try:
-        shim, _expected = _build_shim()
-    except RuntimeError:
-        return False
-    upload_dir = _remote_tmpdir([*ssh_command(), "-o", "BatchMode=yes", alias])
-    if upload_dir is None:
-        return False
-    up = subprocess.run(
-        [
-            *scp_command(),
-            "-q",
-            "-o",
-            "BatchMode=yes",
-            str(shim),
-            f"{alias}:{upload_dir}/safereach-shim",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if up.returncode != 0:
-        return False
-    inst = subprocess.run(
-        [
-            *ssh_command(),
-            "-o",
-            "BatchMode=yes",
-            alias,
-            f'install -m 0755 "{upload_dir}/safereach-shim" "$HOME/.local/bin/safereach-shim" '
-            f'&& rm -rf "{upload_dir}"',
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return inst.returncode == 0
 
 
 # --------------------------------------------------------------------------------------
@@ -2227,7 +2207,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     console.print()
     table = status_table("", "Host", "Status", title="Connectivity")
-    for marker, alias, detail in asyncio.run(_probe_hosts(settings, expected, fix=args.fix)):
+    rows = asyncio.run(_probe_hosts(settings, expected))
+    if args.fix:
+        rows = _fix_stale(rows, settings, args, expected)
+    for marker, alias, detail in rows:
         status = {OK: "ok", WARN: "warn"}.get(marker, "bad")
         table.add_row(status_mark(status), f"[host]{alias}[/host]", detail)
         if marker != OK:
@@ -2635,43 +2618,99 @@ def cmd_shim_update(args: argparse.Namespace) -> int:
 
     failures = 0
     for host in hosts:
-        port = str(host.ssh_port(settings.defaults))
-        target = f"{args.admin_user}@{host.hostname}"
-        upload_dir = _remote_tmpdir([*ssh_command(), "-p", port, target])
-        if upload_dir is None:
-            say(f"{BAD} {host.alias}: could not create a temporary directory on the host")
-            failures += 1
-            continue
-        up = subprocess.run(
-            [*scp_command(), "-P", port, str(shim_path), f"{target}:{upload_dir}/safereach-shim"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if up.returncode != 0:
-            say(f"{BAD} {host.alias}: scp failed: {up.stderr.strip()}")
-            failures += 1
-            continue
-        inst = subprocess.run(
-            [
-                *ssh_command(),
-                "-p",
-                port,
-                target,
-                f'sudo -n install -o root -g root -m 0755 "{upload_dir}/safereach-shim" '
-                f'/usr/local/bin/safereach-shim && rm -rf "{upload_dir}"',
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if inst.returncode != 0:
-            say(f"{BAD} {host.alias}: install failed: {inst.stderr.strip()}")
-            failures += 1
-            continue
-        say(f"{OK} {host.alias}: updated to {expected}")
-
+        ok, detail = _update_shim(host, settings, args, shim_path, expected)
+        say(f"{OK if ok else BAD} {host.alias}: {detail}")
+        failures += not ok
     return 1 if failures else 0
+
+
+#: Replaces whichever shim(s) the host has, from the copy arriving on stdin. A plain
+#: enrolment's shim lives in the account's own ~/.local/bin and needs no root; a hardened
+#: one is root-owned in /usr/local/bin. 0.5.0's `shim-update` only knew the second, so
+#: on a plain host it tried `sudo` against the wrong file — and, for a host resolved
+#: through ~/.ssh/config, connected to `user@None` before even getting that far.
+SHIM_UPDATE_SCRIPT = r"""set -eu
+d=$(mktemp -d /tmp/safereach.XXXXXX)
+trap 'rm -rf "$d"' EXIT
+cat > "$d/safereach-shim"
+updated=""
+if [ -e "$HOME/.local/bin/safereach-shim" ]; then
+    install -m 0755 "$d/safereach-shim" "$HOME/.local/bin/safereach-shim"
+    updated="$updated user"
+fi
+if [ -e /usr/local/bin/safereach-shim ]; then
+    if sudo -n install -o root -g root -m 0755 "$d/safereach-shim" /usr/local/bin/safereach-shim 2>/dev/null; then
+        updated="$updated root"
+    else
+        echo "ROOT_NEEDS_SUDO=1"
+    fi
+fi
+echo "UPDATED=$updated"
+"""
+
+
+def _update_shim(
+    host: HostConfig,
+    settings: Settings,
+    args: argparse.Namespace,
+    shim_path: Path,
+    expected: str,
+) -> tuple[bool, str]:
+    """Install a fresh shim on one host and PROVE it took; return ``(ok, detail)``.
+
+    Reaches the host with the operator's own access (the enrolled key can only run the
+    shim), by the same route `unenroll` uses. Success is decided by the enrolled key
+    answering with the new fingerprint, not by the copy step exiting 0 — a copy into a
+    path the forced command does not run is exactly how 0.5.0 left hosts stale.
+    """
+    ssh_argv = _admin_ssh_argv(host, host.alias, args)
+    try:
+        proc = subprocess.run(
+            [*ssh_argv, f"bash -c {shlex.quote(SHIM_UPDATE_SCRIPT)}"],
+            input=shim_path.read_bytes(),
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "timed out reaching the host as an administrator"
+    out = proc.stdout.decode("utf-8", "replace")
+    info = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        return (
+            False,
+            f"could not reach the host as an administrator: {err[-200:] or 'exit ' + str(proc.returncode)}",
+        )
+    if not info.get("UPDATED", "").strip():
+        return False, (
+            "no safereach-shim found to update — this host is not enrolled; "
+            f"run `safereach enroll {host.ssh_config_host or host.alias}`"
+        )
+
+    try:
+        version, _code = asyncio.run(_probe_one(settings, host))
+    except SSHError as exc:
+        return False, f"shim copied, but the enrolled key could not connect: {exc}"
+    if version == expected:
+        return (
+            True,
+            f"updated to {expected} ({info['UPDATED'].strip()}), verified with the enrolled key",
+        )
+    hint = (
+        " — its shim is root-owned; re-run with --via <alias with passwordless sudo>"
+        if info.get("ROOT_NEEDS_SUDO")
+        else ""
+    )
+    return False, f"enrolled key still reports {version or 'no shim'}, expected {expected}{hint}"
+
+
+async def _probe_one(settings: Settings, host: HostConfig) -> tuple[str | None, int]:
+    pool = SSHPool(settings.defaults)
+    try:
+        return await pool.shim_probe(host)
+    finally:
+        await pool.close()
 
 
 # --------------------------------------------------------------------------------------
@@ -3032,6 +3071,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("doctor", help="verify config, keys, connectivity and shim versions")
     p.add_argument("--offline", action="store_true", help="skip network checks")
     p.add_argument("--fix", action="store_true", help="re-push the shim to any drifted host")
+    p.add_argument(
+        "--via", metavar="SSH_ALIAS", help="--fix: ssh_config alias with admin access to the host"
+    )
+    p.add_argument(
+        "--admin-user",
+        default=os.environ.get("USER", "root"),
+        help="--fix: account used as admin@hostname when no alias resolves to the host",
+    )
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser(
@@ -3050,7 +3097,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("shim-update", help="rebuild and redeploy the shim")
     p.add_argument("host", nargs="?")
     p.add_argument("--all", action="store_true")
-    p.add_argument("--admin-user", default=os.environ.get("USER", "root"))
+    p.add_argument(
+        "--via", metavar="SSH_ALIAS", help="ssh_config alias with admin access to the host"
+    )
+    p.add_argument(
+        "--admin-user",
+        default=os.environ.get("USER", "root"),
+        help="account used as admin@hostname when no alias resolves to the host",
+    )
     p.set_defaults(func=cmd_shim_update)
 
     p = sub.add_parser("shim-build", help="write the shim to a file without deploying it")
