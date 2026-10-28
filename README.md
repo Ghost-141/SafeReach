@@ -20,8 +20,8 @@ or reach a host it wasn't granted.
 ## Quick start
 
 ```bash
-uvx safereach@0.5.0 enroll --all      # set up every server you can already ssh to
-uvx safereach@0.5.0 install           # register with your agents
+uvx safereach@0.5.1 enroll --all      # set up every server you can already ssh to
+uvx safereach@0.5.1 install           # register with your agents
 ```
 
 Two commands. **No sudo required, no config file to edit, nothing installed globally.**
@@ -87,7 +87,7 @@ mode, one container.
 ### Recommended — `uvx`, pinned
 
 ```bash
-uvx safereach@0.5.0 --help
+uvx safereach@0.5.1 --help
 ```
 
 Nothing installed globally, and it is the one launch form that works identically for every
@@ -103,7 +103,7 @@ recommended.
 ### Alternative — a persistent install
 
 ```bash
-uv tool install safereach==0.5.0
+uv tool install safereach==0.5.1
 ```
 
 To work from a checkout, see [CONTRIBUTING.md](CONTRIBUTING.md#development-setup).
@@ -255,11 +255,10 @@ safereach shim-update --all         # when the release changed the allowlist or 
 safereach enroll <host> --hardened  # when the release changed root-owned host state
 ```
 
-Coming from 0.4.0: `install`, then re-enrol your hosts — 0.5.0 changes the shim, and
-re-enrolling both installs it and runs the new log-source scan. Name every host in one
-`enroll` command (`safereach enroll web-1 db-1 …`): enrolment writes `hosts.yaml` from the
-hosts in that run. Coming from 0.1.1? Go straight to 0.5.0 and run all three. Until the
-new shim is on a host, a
+Coming from 0.4.0: `install`, then `safereach doctor --fix` — it updates the shim on
+every stale host, plain or hardened, and checks each one with the enrolled key. Then
+`safereach logs scan <host>` to pick each host's log sources. Coming from 0.1.1? Go
+straight to 0.5.1 and run all three. Until the new shim is on a host, a
 host on the old rules is **refused**, with a message naming the fingerprints — a host
 quietly running an older, looser allowlist is the failure mode this tool exists to
 prevent. Enrolment is idempotent, so re-running it is always safe.

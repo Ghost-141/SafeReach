@@ -4,6 +4,35 @@ All notable changes, newest first. Versions are PyPI releases; each is tagged `v
 Every entry says what a user has to do on upgrade, because a shim fingerprint change
 refuses every host until `safereach shim-update --all` runs.
 
+## 0.5.1 — updating hosts enrolled before 0.5.0
+
+Fixes the upgrade to 0.5.0. Hosts enrolled with an earlier version could not be moved to
+the new shim, so the 0.5.0 agent refused every one of them and no logs could be read.
+The shim fingerprint is **unchanged** from 0.5.0 (`230f8a1d93ee`). Upgrade with:
+
+```bash
+uvx safereach@0.5.1 install
+safereach doctor --fix          # updates every stale host and verifies it
+safereach logs scan <host>      # then choose each host's log sources
+```
+
+- **`shim-update` works on plain hosts.** It connected to `admin@hostname`, which for a
+  host resolved through `~/.ssh/config` (no `hostname` in `hosts.yaml`) became
+  `user@None`; and it only installed the hardened `/usr/local/bin` shim, never the
+  `~/.local/bin` one a plain enrolment's forced command runs. It now reaches the host
+  the way `unenroll` does (`--via`, else the host's ssh alias, else `admin@hostname`),
+  sends the shim in one SSH call, and replaces whichever shim the host has — the
+  user-level one without root, the root-owned one under `sudo -n`.
+- **An update is reported only once it is proved.** `shim-update` and `doctor --fix`
+  now check that the enrolled key answers with the new fingerprint. A copy into a path
+  the forced command does not run is reported as a failure, not as "updated".
+- **`doctor --fix` uses the same updater**, so it no longer assumes the `hosts.yaml`
+  key is an ssh alias (a renamed host could not be fixed). `--via` and `--admin-user`
+  are accepted.
+- **A fixed host works without restarting the agent.** The MCP server cached a stale
+  shim answer for the whole session; it now re-checks on the next call, and the refusal
+  names `shim-update <alias>` / `doctor --fix`.
+
 ## 0.5.0 — reading the logs that matter
 
 The shim fingerprint **changes** (validator, spec and shim all changed), so every host
