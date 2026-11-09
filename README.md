@@ -20,8 +20,8 @@ or reach a host it wasn't granted.
 ## Quick start
 
 ```bash
-uvx safereach@0.5.1 enroll --all      # set up every server you can already ssh to
-uvx safereach@0.5.1 install           # register with your agents
+uvx safereach@0.5.2 enroll --all      # set up every server you can already ssh to
+uvx safereach@0.5.2 install           # register with your agents
 ```
 
 Two commands. **No sudo required, no config file to edit, nothing installed globally.**
@@ -87,7 +87,7 @@ mode, one container.
 ### Recommended — `uvx`, pinned
 
 ```bash
-uvx safereach@0.5.1 --help
+uvx safereach@0.5.2 --help
 ```
 
 Nothing installed globally, and it is the one launch form that works identically for every
@@ -103,7 +103,7 @@ recommended.
 ### Alternative — a persistent install
 
 ```bash
-uv tool install safereach==0.5.1
+uv tool install safereach==0.5.2
 ```
 
 To work from a checkout, see [CONTRIBUTING.md](CONTRIBUTING.md#development-setup).
@@ -258,7 +258,7 @@ safereach enroll <host> --hardened  # when the release changed root-owned host s
 Coming from 0.4.0: `install`, then `safereach doctor --fix` — it updates the shim on
 every stale host, plain or hardened, and checks each one with the enrolled key. Then
 `safereach logs scan <host>` to pick each host's log sources. Coming from 0.1.1? Go
-straight to 0.5.1 and run all three. Until the new shim is on a host, a
+straight to 0.5.2 and run all three. Until the new shim is on a host, a
 host on the old rules is **refused**, with a message naming the fingerprints — a host
 quietly running an older, looser allowlist is the failure mode this tool exists to
 prevent. Enrolment is idempotent, so re-running it is always safe.

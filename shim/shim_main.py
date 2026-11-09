@@ -62,6 +62,7 @@ from safereach.validator import (  # noqa: E402
     check_log_dir,
     check_log_source,
     docker_host_deny_targets,
+    effective_allow,
     keeps_tail,
     render,
     validate,
@@ -480,7 +481,12 @@ def _handle_run(payload: str, cfg: dict[str, Any]) -> int:
 _RELATIVE_TIME_RE = re.compile(r"^([0-9]{1,4})([smhd])$")
 _ABSOLUTE_TIME_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}( [0-9]{2}:[0-9]{2}(:[0-9]{2})?)?$")
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+#: Files read when tailing (no pattern): the newest few are where "the last N lines" live.
 _LOGS_MAX_FILES = 3
+#: Files searched when there IS a pattern. A search is for something that happened at an
+#: unknown time — a request ID, an incident — so it covers the whole `since` window, up
+#: to this many files (an app writing error- and debug- files daily fills two a day).
+_LOGS_MAX_GREP_FILES = 32
 _LOGS_MAX_LINES = 2000
 
 
@@ -525,11 +531,11 @@ def _docker_time(spelling: str) -> str:
 
 
 def _source_files(source: dict[str, str], since: float | None, deny_paths: list[str]) -> list[str]:
-    """The newest files a ``file`` source names, oldest first so output reads in order.
+    """Every file a ``file`` source names within the window, oldest first.
 
     Every candidate is re-checked as a path in its own right: a regular file, not on the
     protected list, and still inside the directory after resolving symlinks. The glob
-    picks names; it never widens what may be read.
+    picks names; it never widens what may be read. The caller decides how many to read.
     """
     directory = source["dir"]
     real_dir = os.path.realpath(directory).rstrip("/") + "/"
@@ -552,13 +558,15 @@ def _source_files(source: dict[str, str], since: float | None, deny_paths: list[
             st = os.stat(real)
         except OSError:
             continue
-        if not stat.S_ISREG(st.st_mode):
+        # Empty files hold nothing to search but would still take a slot under the cap —
+        # an app that opens a log per day per subsystem leaves one empty file a day.
+        if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
             continue
         if since is not None and st.st_mtime < since:
             continue
         found.append((st.st_mtime, path))
     found.sort()
-    return [path for _, path in found[-_LOGS_MAX_FILES:]]
+    return [path for _, path in found]
 
 
 def handle_logs(payload: str, cfg: dict[str, Any]) -> int:
@@ -626,20 +634,37 @@ def handle_logs(payload: str, cfg: dict[str, Any]) -> int:
         argv.append(source["container"])
         line_filter = compiled
     else:
-        files = _source_files(source, since[1] if since else None, ctx["deny_paths"])
-        if not files:
+        in_window = _source_files(source, since[1] if since else None, ctx["deny_paths"])
+        if not in_window:
             print(f"{note}: no files matching {source['glob']} in {source['dir']}", file=sys.stderr)
             return 0
+        cap = _LOGS_MAX_GREP_FILES if pattern else _LOGS_MAX_FILES
+        files = in_window[-cap:]
+        skipped: list[str] = []
+        if len(in_window) > len(files):
+            skipped.append(
+                f"{len(in_window) - len(files)} older file(s) not searched — narrow `since`"
+            )
         allow = cfg.get("allow")
-        if any(f.endswith(".gz") for f in files) and allow is not None and "zgrep" not in allow:
-            files = [f for f in files if not f.endswith(".gz")] or files
+        if allow is not None and "zgrep" not in effective_allow(allow):
+            gz = [f for f in files if f.endswith(".gz")]
+            if gz:
+                files = [f for f in files if not f.endswith(".gz")]
+                skipped.append(f"{len(gz)} compressed file(s) skipped — zgrep is not permitted")
+        if not files:
+            print(f"{note}: nothing readable; {'; '.join(skipped)}", file=sys.stderr)
+            return 0
         rotated = any(f.endswith(".gz") for f in files)
         if pattern or rotated:
             # zgrep reads plain files as well as .gz, so one argv covers a mixed set.
             argv = ["zgrep" if rotated else "grep", "-h", "-E", pattern or "^", *files]
         else:
             argv = ["tail", "-q", "-n", str(lines), *files]
-        note += f": {', '.join(f.rsplit('/', 1)[-1] for f in files)}"
+        names = [f.rsplit("/", 1)[-1] for f in files]
+        listed = ", ".join(names) if len(names) <= 4 else f"{names[0]} … {names[-1]}"
+        note += f": {len(names)} file(s), {listed}"
+        if skipped:
+            note += f" ({'; '.join(skipped)})"
         if until:
             note += " (until filters which files are read only by date, not lines within them)"
 

@@ -40,6 +40,7 @@ __all__ = [
     "check_log_dir",
     "check_log_source",
     "docker_host_deny_targets",
+    "effective_allow",
     "keeps_tail",
     "trim_output",
     "ValidationResult",
@@ -925,6 +926,22 @@ def validate(
     return validate_argv(argv, spec, allow=allow, ctx=ctx)
 
 
+#: Binaries a host permits implicitly because it permits another that reads the same
+#: things. `zgrep` is `grep` over decompressed text, under the same path rules; a host
+#: enrolled before zgrep existed kept an allow list without it, and every rotated `.gz`
+#: log on that host became unsearchable — silently, because nothing said it was skipped.
+IMPLIED_ALLOW: dict[str, tuple[str, ...]] = {"grep": ("zgrep",)}
+
+
+def effective_allow(allow: list[str] | set[str] | tuple[str, ...]) -> set[str]:
+    """A host's allow list plus everything it implies (see IMPLIED_ALLOW)."""
+    out = set(allow)
+    for binary, implied in IMPLIED_ALLOW.items():
+        if binary in out:
+            out.update(implied)
+    return out
+
+
 def _unquoted_meta(command: str) -> str | None:
     """The first shell operator character that sits outside any quotes, if one does.
 
@@ -1013,7 +1030,7 @@ def validate_argv(
             f"{binary!r} is not an allowlisted command",
             "call `describe_commands` to see what is available",
         )
-    if allow is not None and binary not in set(allow):
+    if allow is not None and binary not in effective_allow(allow):
         raise Rejected(
             f"{binary!r} is not permitted on this host",
             "call `list_hosts` to see what each host allows",
@@ -1283,6 +1300,7 @@ def spec_summary(
     locations instead of discovering them one refusal at a time.
     """
     ctx = ctx or {}
+    allow = sorted(effective_allow(allow)) if allow is not None else None
     out: dict[str, Any] = {}
     for binary, bspec in sorted(spec.items()):
         if allow is not None and binary not in allow:
