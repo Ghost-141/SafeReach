@@ -289,11 +289,20 @@ class Settings(BaseModel):
     source_path: Path | None = None
 
     def host(self, alias: str) -> HostConfig:
-        try:
+        """Look a host up by alias; a unique case-insensitive match also counts.
+
+        Aliases change (`rename`), and an agent carrying the old spelling from an earlier
+        conversation — `Synapse-Sandbox` for `synapse-sandbox` — was refused outright.
+        Case is the one difference that cannot name a different machine, so it is
+        forgiven, but only when exactly one host matches.
+        """
+        if alias in self.hosts:
             return self.hosts[alias]
-        except KeyError:
-            known = ", ".join(sorted(self.hosts)) or "(none configured)"
-            raise KeyError(f"unknown host {alias!r}; configured hosts: {known}") from None
+        folded = [key for key in self.hosts if key.casefold() == alias.casefold()]
+        if len(folded) == 1:
+            return self.hosts[folded[0]]
+        known = ", ".join(sorted(self.hosts)) or "(none configured)"
+        raise KeyError(f"unknown host {alias!r}; configured hosts: {known}")
 
     def audit_path(self) -> Path:
         return Path(self.defaults.audit_log).expanduser()

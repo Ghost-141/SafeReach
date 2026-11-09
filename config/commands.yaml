@@ -284,6 +284,9 @@ grep:
     "-r": { alias: "--recursive", value: none }
     "-v": { alias: "--invert-match", value: none }
     "-h": { alias: "--no-filename", value: none }
+    # Prints only the NAMES of matching files — how an agent finds which day's log holds a
+    # request ID before reading it. Names, never contents.
+    "-l": { alias: "--files-with-matches", value: none }
     "-m": { alias: "--max-count", value: { type: int, min: 1, max: 2000 } }
     "-A": { alias: "--after-context", value: { type: int, min: 0, max: 20 } }
     "-B": { alias: "--before-context", value: { type: int, min: 0, max: 20 } }
@@ -293,7 +296,11 @@ grep:
     # flat rule loose enough for the pattern would also permit `grep root /etc/shadow`.
     # The pattern is handed to grep as one argv element with no shell anywhere, so it
     # may use the whole regex alphabet: `grep -E "timeout|ECONNRESET" …`, `"error$"`.
-    max: 4
+    #
+    # Up to 32 files: an app that rotates daily into error-/debug- pairs has two files a
+    # day, and a search over "the last two weeks" has to be one call. Every file is still
+    # held to the path rules below.
+    max: 33
     specs:
       - { pattern: '.{1,200}' }
     rest:
@@ -319,11 +326,12 @@ zgrep:
     "-F": { alias: "--fixed-strings", value: none }
     "-v": { alias: "--invert-match", value: none }
     "-h": { alias: "--no-filename", value: none }
+    "-l": { alias: "--files-with-matches", value: none }
     "-m": { alias: "--max-count", value: { type: int, min: 1, max: 2000 } }
     "-A": { alias: "--after-context", value: { type: int, min: 0, max: 20 } }
     "-B": { alias: "--before-context", value: { type: int, min: 0, max: 20 } }
   positionals:
-    max: 4
+    max: 33
     specs:
       - { pattern: '.{1,200}' }
     rest:

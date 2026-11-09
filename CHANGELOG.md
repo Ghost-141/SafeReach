@@ -4,6 +4,38 @@ All notable changes, newest first. Versions are PyPI releases; each is tagged `v
 Every entry says what a user has to do on upgrade, because a shim fingerprint change
 refuses every host until `safereach shim-update --all` runs.
 
+## 0.5.2 — searching rotated logs
+
+An agent investigating an incident could not find a request ID from earlier in the week.
+The app compressed every earlier day's log to `.gz`, and on a host enrolled before 0.5.0
+nothing could search those files — while `read_logs` answered "no lines matched" instead
+of saying it had skipped them. The shim fingerprint **changes** (allowlist and shim), so
+update every host once:
+
+```bash
+uvx safereach@0.5.2 install
+safereach doctor --fix
+```
+
+- **`zgrep` is permitted wherever `grep` is.** Hosts enrolled before 0.5.0 kept an allow
+  list without `zgrep`, so rotated `.gz` logs were unsearchable there. `zgrep` is `grep`
+  over decompressed text under the same path rules, so it is now implied — no
+  `hosts.yaml` edit or re-enrolment needed.
+- **`read_logs` with `grep` searches the whole `since` window,** rotated files included,
+  up to the newest 32 files (two weeks of an app that writes an error and a debug file a
+  day). It read at most the three newest before, whatever `since` said. Without `grep` it
+  still tails the newest files. Empty files are skipped, so they do not use up the cap.
+  Checked against the live host before release: a request ID from five days earlier,
+  in a compressed file, is now found, where the same search returned nothing on 0.5.1.
+- **Nothing is skipped silently.** When files fall outside the cap, or compressed files
+  cannot be read on a host that permits neither `grep` nor `zgrep`, the note says how
+  many and why.
+- **`grep -l` / `zgrep -l`** (`--files-with-matches`) are allowed: they print only the
+  names of matching files, which is how to find which day's log holds an ID. `grep` and
+  `zgrep` take up to 32 files in one call; every path is held to the same rules.
+- **Host names match case-insensitively** when exactly one host matches. An agent still
+  using the old spelling `Synapse-Sandbox` for `synapse-sandbox` was refused outright.
+
 ## 0.5.1 — updating hosts enrolled before 0.5.0
 
 Fixes the upgrade to 0.5.0. Hosts enrolled with an earlier version could not be moved to

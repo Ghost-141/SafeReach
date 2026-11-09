@@ -662,6 +662,9 @@ async def read_logs(
       text (`"Forbidden"`) rather than a coloured level word (`"warn:"`).
     - `since` / `until`: relative (`30m`, `2h`, `7d`) or a date (`2026-10-22`,
       `2026-10-22 14:05`). For file sources they choose which files are read by date.
+      With `grep`, every file in the window is searched — rotated `.gz` days included,
+      up to the newest 32 files — so a request ID from last week is found. The note in
+      `stderr` names how many files were searched and anything left out.
     - `lines`: how many of the newest lines to return (1–2000, default 200).
 
     Output is in time order with the newest lines last; when `truncated` is true, narrow
